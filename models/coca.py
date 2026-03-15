@@ -1,53 +1,55 @@
-from typing import Tuple
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoders.get_ts_model import get_ts_model
 from .encoders.get_language_model import get_language_model
+from .decoders.get_decoder import get_decoder
 from .heads import get_head
+from losses.contrastive_loss import ContrastiveLoss
+
 
 class CoCa(nn.Module):
+
     def __init__(
         self,
         ts_arch: str,
         language_arch: str,
+        decoder_arch: str,
+        decoder_pretrained_name: Optional[str],
         head_arch: str,
-        ts_pre_train_path: str,
-        language_pre_train_path: str,
+        ts_pre_train_path: Optional[str],
+        patchtst_pretrained_name: Optional[str],
+        language_pre_train_path: Optional[str],
         projection_dim: int,
-        vocab_size: int,
-        decoder_layers: int = 4,
-        decoder_heads: int = 8,
-    ) -> None:
+        caption_loss_weight: float = 1.0,
+        contrastive_loss_weight: float = 1.0,
+        temperature: float = 0.07,
+    ):
         super().__init__()
-        
+
         self.projection_dim = projection_dim
-        
-        # --------------------
-        # TS embedding dim
-        # --------------------
-        if ts_arch == 'ts2vec':
+        self.caption_loss_weight = caption_loss_weight
+        self.contrastive_loss_weight = contrastive_loss_weight
+
+        # Embedding dimensions 
+
+        if ts_arch in ["ts2vec", "cnn", "lstm", "transformer", "rnn", "patchtst"]:
             self.ts_emb_dim = 320
         else:
             raise ValueError(f"TS encoder {ts_arch} not supported")
 
-        # ----------------------
-        # Language embedding dim
-        # ----------------------
-        if language_arch == 'llama':
-            self.lang_emb_dim = 4096
-        elif language_arch in ['bert', 'bioclinicalbert']:
+        if language_arch in ["bert", "bioclinicalbert"]:
             self.lang_emb_dim = 768
         else:
-            raise ValueError(f'language encoder {language_arch} not supported')
+            raise ValueError(f"Language encoder {language_arch} not supported")
 
-        # --------------------
         # Encoders
-        # --------------------
         self.ts_enc = get_ts_model(
             arch=ts_arch,
-            ts_pre_train_path=ts_pre_train_path
+            ts_pre_train_path=ts_pre_train_path,
+            patchtst_pretrained_name=patchtst_pretrained_name,
         )
 
         self.language_enc = get_language_model(
@@ -55,9 +57,14 @@ class CoCa(nn.Module):
             language_pre_train_path=language_pre_train_path
         )
 
-        # --------------------
-        # Projectors (contrastive)
-        # --------------------
+        # Decoder (generative branch)
+        self.decoder = get_decoder(
+            arch=decoder_arch,
+            ts_embedding_dim=self.ts_emb_dim,
+            pretrained_name=decoder_pretrained_name,
+        )
+
+        # Projection heads (contrastive)
         self.ts_projector = get_head(
             head_arch=head_arch,
             embedding_dim=self.ts_emb_dim,
@@ -70,93 +77,80 @@ class CoCa(nn.Module):
             projection_dim=self.projection_dim
         )
 
-        # --------------------
-        # Cross-attention Decoder
-        # --------------------
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.lang_emb_dim,
-            nhead=decoder_heads,
-            batch_first=True
+        # Contrastive loss
+        self.contrastive_loss = ContrastiveLoss(temperature=temperature)
+
+        # Learnable temperature
+        self.log_temperature = nn.Parameter(
+            torch.tensor(1 / temperature).log()
         )
 
-        self.decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=decoder_layers
-        )
-
-        self.lm_head = nn.Linear(self.lang_emb_dim, vocab_size)
-
-        # learned temperature for contrastive
-        self.logit_scale = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(1/0.07)))
-
-    # -------------------------------------------------
-
+    # Forward
     def forward(
         self,
         x_ts: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        labels: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.Tensor] = None,
+        decoder_attention_mask: Optional[torch.Tensor] = None,
+        return_loss: bool = False,
+        return_embeddings: bool = False,
+    ):
 
-        """
-        Args:
-            x_ts: (B, T_ts, C)
-            input_ids: (B, T_text)
-            attention_mask: (B, T_text)
+        # Time-series encoding
+        ts_tokens = self.ts_enc(x_ts)           # (B, L+1, 320)
+        ts_global = ts_tokens[:, 0]             # CLS/global
 
-        Returns:
-            ts_proj: normalized projected TS embeddings
-            lang_proj: normalized projected CLS embeddings
-            lm_logits: language modeling logits
-        """
-
-        # =====================================================
-        # 1️⃣ TS encoding (sequence features)
-        # =====================================================
-        ts_features = self.ts_enc(x_ts)   # (B, T_ts, D_ts)
-
-        # pooled representation for contrastive
-        ts_pooled = ts_features.mean(dim=1)
-        ts_proj = self.ts_projector(ts_pooled)
-        ts_proj = F.normalize(ts_proj, dim=-1)
-
-        # =====================================================
-        # 2️⃣ Language encoding (contrastive branch)
-        # =====================================================
+        # Text encoding (for contrastive)
         lang_out = self.language_enc(
             input_ids=input_ids,
             attention_mask=attention_mask
         )
 
         if isinstance(lang_out, tuple):
-            lang_hidden = lang_out[0]   # (B, T_text, D)
+            text_cls = lang_out[0]
         else:
-            lang_hidden = lang_out
+            text_cls = lang_out
 
-        cls_emb = lang_hidden[:, 0, :]  # CLS token
-        lang_proj = self.language_projector(cls_emb)
-        lang_proj = F.normalize(lang_proj, dim=-1)
+        # Contrastive projections
+        ts_proj = self.ts_projector(ts_global)
+        text_proj = self.language_projector(text_cls)
 
-        # =====================================================
-        # 3️⃣ Generative branch (cross-attention)
-        # =====================================================
+        ts_proj = F.normalize(ts_proj, dim=-1)
+        text_proj = F.normalize(text_proj, dim=-1)
 
-        # Use full token embeddings as target
-        tgt_embeddings = lang_hidden  # (B, T_text, D)
+        if return_embeddings:
+            return ts_proj, text_proj
 
-        # memory = TS features projected to lang dim if needed
-        if ts_features.size(-1) != self.lang_emb_dim:
-            ts_features = nn.Linear(
-                ts_features.size(-1),
-                self.lang_emb_dim
-            ).to(ts_features.device)(ts_features)
+        if decoder_input_ids is None:
+            decoder_input_ids = input_ids
+        if decoder_attention_mask is None:
+            decoder_attention_mask = attention_mask
 
-        decoded = self.decoder(
-            tgt=tgt_embeddings,
-            memory=ts_features,
-            tgt_key_padding_mask=~attention_mask.bool()
+        # Captioning 
+        decoder_outputs = self.decoder(
+            ecg_tokens=ts_tokens,
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            labels=labels
         )
 
-        lm_logits = self.lm_head(decoded)  # (B, T_text, vocab_size)
+        if not return_loss:
+            return decoder_outputs
 
-        return ts_proj, lang_proj, lm_logits
+        # Loss computation
+    
+        caption_loss = decoder_outputs.loss
+        contrastive_loss = self.contrastive_loss(
+            ts_proj,
+            text_proj,
+            logit_scale=self.log_temperature.exp(),
+        )
+
+        total_loss = (
+            self.caption_loss_weight * caption_loss +
+            self.contrastive_loss_weight * contrastive_loss
+        )
+
+        return total_loss

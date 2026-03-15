@@ -9,7 +9,13 @@ class ContrastiveLoss(nn.Module):
         super().__init__()
         self.temperature = temperature
 
-    def forward(self, emb_ts: torch.Tensor, emb_text: torch.Tensor):
+    def forward(
+        self,
+        emb_ts: torch.Tensor,
+        emb_text: torch.Tensor,
+        temperature: torch.Tensor | float | None = None,
+        logit_scale: torch.Tensor | float | None = None,
+    ):
         """
         Args:
             emb_ts: (B, D) time-series embeddings (normalized)
@@ -22,7 +28,11 @@ class ContrastiveLoss(nn.Module):
         # Similarity matrix
         # -------------------------
         # cosine similarity since embeddings are normalized
-        logits = torch.matmul(emb_ts, emb_text.T) / self.temperature
+        if logit_scale is not None:
+            logits = torch.matmul(emb_ts, emb_text.T) * logit_scale
+        else:
+            effective_temperature = self.temperature if temperature is None else temperature
+            logits = torch.matmul(emb_ts, emb_text.T) / effective_temperature
         # shape: (B, B)
         batch_size = emb_ts.size(0)
 

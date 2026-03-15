@@ -94,7 +94,8 @@ class CLIP(nn.Module):
 
 
         ts_out = self.ts_enc(x_ts)
-        out_ts = self.ts_projector(ts_out)
+        ts_cls = ts_out[:, 0, :]
+        out_ts = self.ts_projector(ts_cls)
 
 
         lang_out = self.language_enc(
