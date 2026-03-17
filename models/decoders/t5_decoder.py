@@ -11,6 +11,9 @@ class T5Decoder(nn.Module):
         config = AutoConfig.from_pretrained(pretrained_name)
         config.tie_word_embeddings = False
         self.model = T5ForConditionalGeneration.from_pretrained(pretrained_name, config=config)
+        # We always bypass T5's encoder by injecting ECG features as pre-computed
+        # encoder_outputs. Delete the encoder to free GPU memory.
+        self.model.encoder = None
         self.project_ecg = nn.Linear(ecg_dim, self.model.config.d_model)
 
     def _project_ecg(self, ecg_tokens):
@@ -29,17 +32,19 @@ class T5Decoder(nn.Module):
         attention_mask,
         labels=None,
     ):
-        ecg_proj, ecg_attention_mask = self._project_ecg(ecg_tokens)
+        ecg_proj, _ = self._project_ecg(ecg_tokens)   # ECG mask is all-ones, not needed
 
         model_kwargs = {
-            "decoder_input_ids": input_ids,
-            "decoder_attention_mask": attention_mask,
             "encoder_outputs": BaseModelOutput(last_hidden_state=ecg_proj),
-            "encoder_attention_mask": ecg_attention_mask,
-            "return_dict": True,
+            # No encoder attention mask: all ECG tokens are valid (all-ones is T5's default)
+            "decoder_attention_mask": attention_mask,
         }
         if labels is not None:
+            # Let T5 auto-create decoder_input_ids via _shift_right(labels).
+            # This ensures decoder_input_ids[i] != labels[i] (proper teacher forcing).
             model_kwargs["labels"] = labels
+        else:
+            model_kwargs["decoder_input_ids"] = input_ids
 
         outputs = self.model(**model_kwargs)
         return outputs

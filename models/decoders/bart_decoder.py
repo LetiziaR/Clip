@@ -10,8 +10,12 @@ class BartDecoder(nn.Module):
         super().__init__()
         # Load pretrained BART model (encoder-decoder model)
         # reuse ONLY the decoder part, and give ECG features as encoder outputs.
-        self.model = BartForConditionalGeneration.from_pretrained(pretrained_name)
-        self.model.config._attn_implementation = "eager"
+        self.model = BartForConditionalGeneration.from_pretrained(
+            pretrained_name, attn_implementation="eager"
+        )
+        # We always bypass BART's encoder by injecting ECG features as
+        # pre-computed encoder_outputs. Delete the encoder to free GPU memory.
+        self.model.model.encoder = None
 
         # project ECG token features to BART hidden size
         # ECG encoder outputs tokens of dimension ecg_dim (e.g. 320).
@@ -36,16 +40,19 @@ class BartDecoder(nn.Module):
         labels=None
     ):
         # project ECG features to BART hidden size
-        ecg_proj, ecg_attention_mask = self._project_ecg(ecg_tokens)
+        ecg_proj, _ = self._project_ecg(ecg_tokens)   # ECG mask is all-ones, not needed
 
         model_kwargs = {
-            "decoder_input_ids": input_ids,
             "encoder_outputs": BaseModelOutput(last_hidden_state=ecg_proj),
-            "encoder_attention_mask": ecg_attention_mask,
-            "return_dict": True,
+            # No encoder attention mask: all ECG tokens are valid (all-ones is BART's default)
+            "decoder_attention_mask": attention_mask,
         }
         if labels is not None:
+            # Let BART auto-create decoder_input_ids via shift_tokens_right(labels).
+            # This ensures decoder_input_ids[i] != labels[i] (proper teacher forcing).
             model_kwargs["labels"] = labels
+        else:
+            model_kwargs["decoder_input_ids"] = input_ids
 
         outputs = self.model(**model_kwargs)
 

@@ -1,4 +1,6 @@
 from typing import Optional
+import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,7 +37,7 @@ class CoCa(nn.Module):
 
         # Embedding dimensions 
 
-        if ts_arch in ["ts2vec", "cnn", "lstm", "transformer", "rnn", "patchtst"]:
+        if ts_arch in ["ts2vec", "patchtst"]:
             self.ts_emb_dim = 320
         else:
             raise ValueError(f"TS encoder {ts_arch} not supported")
@@ -78,10 +80,10 @@ class CoCa(nn.Module):
         )
 
         # Contrastive loss
-        self.contrastive_loss = ContrastiveLoss(temperature=temperature)
+        self.contrastive_loss = ContrastiveLoss()
 
-        # Learnable temperature
-        self.log_temperature = nn.Parameter(
+        # Learnable logit scale (log(1/temperature) = log(logit_scale))
+        self.log_logit_scale = nn.Parameter(
             torch.tensor(1 / temperature).log()
         )
 
@@ -98,39 +100,50 @@ class CoCa(nn.Module):
         return_embeddings: bool = False,
     ):
 
-        # Time-series encoding
+        # Time-series encoding (always needed)
         ts_tokens = self.ts_enc(x_ts)           # (B, L+1, 320)
-        ts_global = ts_tokens[:, 0]             # CLS/global
+        ts_global = ts_tokens[:, 0]             # global token for contrastive branch
+        ts_temporal = ts_tokens[:, 1:]          # temporal tokens for decoder branch only
 
-        # Text encoding (for contrastive)
-        lang_out = self.language_enc(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
+        # Contrastive branch — skipped during generation-only inference
+        # (return_loss=False, return_embeddings=False) to avoid running a full
+        # BioClinicalBERT forward pass that produces no output used by the caller.
+        if return_loss or return_embeddings:
+            lang_out = self.language_enc(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            text_cls = lang_out[0] if isinstance(lang_out, tuple) else lang_out
 
-        if isinstance(lang_out, tuple):
-            text_cls = lang_out[0]
-        else:
-            text_cls = lang_out
+            ts_proj = self.ts_projector(ts_global)
+            text_proj = self.language_projector(text_cls)
+            ts_proj = F.normalize(ts_proj, dim=-1)
+            text_proj = F.normalize(text_proj, dim=-1)
 
-        # Contrastive projections
-        ts_proj = self.ts_projector(ts_global)
-        text_proj = self.language_projector(text_cls)
+            if return_embeddings:
+                return ts_proj, text_proj
 
-        ts_proj = F.normalize(ts_proj, dim=-1)
-        text_proj = F.normalize(text_proj, dim=-1)
-
-        if return_embeddings:
-            return ts_proj, text_proj
-
+        # Decoder input IDs must come from the decoder's own tokenizer vocabulary.
+        # Falling back to encoder (BioClinicalBERT) input_ids is only safe for
+        # BART/T5 when labels are provided (decoder auto-shifts from labels and
+        # ignores input_ids). For BioGPT/GPT-2 the input_ids are used directly —
+        # passing the wrong vocabulary will produce garbage outputs.
         if decoder_input_ids is None:
+            warnings.warn(
+                "CoCa.forward: decoder_input_ids is None, falling back to encoder "
+                "input_ids. This is only correct when the encoder and decoder share "
+                "the same tokenizer. Set use_dual_tokenizer=True in the dataset to "
+                "avoid this.",
+                UserWarning,
+                stacklevel=2,
+            )
             decoder_input_ids = input_ids
         if decoder_attention_mask is None:
             decoder_attention_mask = attention_mask
 
-        # Captioning 
+        # Captioning
         decoder_outputs = self.decoder(
-            ecg_tokens=ts_tokens,
+            ecg_tokens=ts_temporal,
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
             labels=labels
@@ -139,13 +152,21 @@ class CoCa(nn.Module):
         if not return_loss:
             return decoder_outputs
 
-        # Loss computation
-    
+        # Caption loss — decoder_outputs.loss is None when labels was not passed,
+        # which would cause a silent TypeError in the weighted sum below.
         caption_loss = decoder_outputs.loss
+        if caption_loss is None:
+            raise ValueError(
+                "CoCa.forward: return_loss=True requires labels to be provided. "
+                "decoder_outputs.loss is None — pass labels to the forward call."
+            )
+
+        # B4: clamp logit scale to prevent NaN from exploding logits
+        self.log_logit_scale.data.clamp_(max=math.log(100))
         contrastive_loss = self.contrastive_loss(
             ts_proj,
             text_proj,
-            logit_scale=self.log_temperature.exp(),
+            logit_scale=self.log_logit_scale.exp(),
         )
 
         total_loss = (

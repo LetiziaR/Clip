@@ -17,7 +17,7 @@ from trainer.coca_trainer import CoCaTrainer
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run CoCa training on PTB-XL")
-    parser.add_argument("--data_root", type=str, default="/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ra59ver2/ptb-xl-project/files/ptb-xl/1.0.3")
+    parser.add_argument("--data_root", type=str, default="/home/ra59ver/coco/.")
     parser.add_argument("--language_model_path", type=str, default="emilyalsentzer/Bio_ClinicalBERT")
     parser.add_argument("--decoder_model_path", type=str, default=None)
     parser.add_argument("--decoder_tokenizer_path", type=str, default=None)
@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument("--patchtst_pretrained_name", type=str, default=None)
     parser.add_argument("--ts_arch", type=str, default="ts2vec", choices=["ts2vec", "patchtst"])
     parser.add_argument("--language_arch", type=str, default="bioclinicalbert")
-    parser.add_argument("--decoder_arch", type=str, default="bart", choices=["bart", "mbart", "gpt2", "t5", "mt5", "biogpt"])
+    parser.add_argument("--decoder_arch", type=str, default="bart", choices=["bart", "gpt2", "t5", "biogpt"])
     parser.add_argument("--head_arch", type=str, default="mlp")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
@@ -44,13 +44,14 @@ def parse_args():
     parser.add_argument("--return_labels", action="store_true")
     parser.add_argument("--label_col", type=str, default="scp_codes")
     parser.add_argument("--label_threshold", type=float, default=0.0)
-    parser.add_argument("--checkpoint_dir", type=str, default="/dss/dsshome1/0F/ra59ver2/Progects/coca/checkpoints")
+    parser.add_argument("--checkpoint_dir", type=str, default="/home/ra59ver/coca/checkpoints/.")
     parser.add_argument("--checkpoint_name", type=str, default="coca")
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--early_stopping_patience", type=int, default=0)
     parser.add_argument("--early_stopping_min_delta", type=float, default=0.0)
+    parser.add_argument("--lr_scheduler", type=str, default="none", choices=["cosine", "none"])
     parser.add_argument("--save_optimizer_state", dest="save_optimizer_state", action="store_true")
     parser.add_argument("--no_save_optimizer_state", dest="save_optimizer_state", action="store_false")
     parser.set_defaults(save_optimizer_state=False)
@@ -136,14 +137,10 @@ def main():
         if decoder_tok_path is None:
             if args.decoder_arch == "bart":
                 decoder_tok_path = "facebook/bart-base"
-            elif args.decoder_arch == "mbart":
-                decoder_tok_path = "facebook/mbart-large-50-many-to-many-mmt"
             elif args.decoder_arch == "gpt2":
                 decoder_tok_path = "gpt2"
             elif args.decoder_arch == "biogpt":
                 decoder_tok_path = "microsoft/biogpt"
-            elif args.decoder_arch == "mt5":
-                decoder_tok_path = "google/mt5-base"
             else:
                 decoder_tok_path = "google/flan-t5-base"
         decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_tok_path)
@@ -244,20 +241,27 @@ def main():
     ).to(device)
 
     optimizer = optim.AdamW(
-        model.parameters(),
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.learning_rate,
         weight_decay=1e-4,
     )
 
+    scheduler = None
+    if args.lr_scheduler == "cosine":
+        total_steps = args.epochs * len(train_loader)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps
+        )
+
     trainer = CoCaTrainer(
         model=model,
         optimizer=optimizer,
-        accelerator=None,
         max_epochs=args.epochs,
         pad_token_id=(decoder_tokenizer.pad_token_id if decoder_tokenizer is not None else encoder_tokenizer.pad_token_id),
         save_dir=None,
         save_name=args.checkpoint_name,
         save_best_only=False,
+        scheduler=scheduler,
     )
 
     best_val_loss = float("inf")
@@ -333,7 +337,7 @@ def main():
     safe_save_checkpoint(last_payload, last_ckpt_path, allow_model_only_fallback=True)
 
     if os.path.exists(best_ckpt_path):
-        checkpoint = torch.load(best_ckpt_path, map_location=device)
+        checkpoint = torch.load(best_ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
         print(f"Loaded best checkpoint from epoch {checkpoint['epoch']}")
 

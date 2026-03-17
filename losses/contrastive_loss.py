@@ -5,9 +5,8 @@ import torch.nn.functional as F
 
 class ContrastiveLoss(nn.Module):
 
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self):
         super().__init__()
-        self.temperature = temperature
 
     def forward(
         self,
@@ -20,19 +19,18 @@ class ContrastiveLoss(nn.Module):
         Args:
             emb_ts: (B, D) time-series embeddings (normalized)
             emb_text: (B, D) text embeddings (normalized)
+            logit_scale: scalar multiplier (1/temperature). Takes priority over temperature.
+            temperature: scalar divisor. Used only when logit_scale is None.
 
         Returns:
             scalar loss
         """
-        # -------------------------
-        # Similarity matrix
-        # -------------------------
-        # cosine similarity since embeddings are normalized
         if logit_scale is not None:
             logits = torch.matmul(emb_ts, emb_text.T) * logit_scale
+        elif temperature is not None:
+            logits = torch.matmul(emb_ts, emb_text.T) / temperature
         else:
-            effective_temperature = self.temperature if temperature is None else temperature
-            logits = torch.matmul(emb_ts, emb_text.T) / effective_temperature
+            raise ValueError("ContrastiveLoss.forward requires either logit_scale or temperature")
         # shape: (B, B)
         batch_size = emb_ts.size(0)
 

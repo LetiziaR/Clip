@@ -43,6 +43,7 @@ def evaluate_generation(
                 x_ts = x_ts.to(device)
 
             ts_tokens = model_ref.ts_enc(x_ts)
+            ts_temporal = ts_tokens[:, 1:]   # exclude global token; matches training (B2)
 
             bos_token_id = getattr(generation_tokenizer, "bos_token_id", None)
             eos_token_id = getattr(generation_tokenizer, "eos_token_id", None)
@@ -53,7 +54,7 @@ def evaluate_generation(
                 eos_token_id = getattr(generation_tokenizer, "sep_token_id", None)
 
             generated_ids = model_ref.decoder.generate(
-                ecg_tokens=ts_tokens,
+                ecg_tokens=ts_temporal,
                 max_new_tokens=max_new_tokens,
                 num_beams=num_beams,
                 do_sample=do_sample,

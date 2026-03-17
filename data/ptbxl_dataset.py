@@ -24,7 +24,7 @@ class PTBXL(Dataset):
         encoder_tokenizer=None,
         decoder_tokenizer=None,
         use_dual_tokenizer=False,
-        sampling_rate=100,
+        sampling_rate=500,
         folds=None,
         target_length=None,
         return_text=True,
@@ -81,12 +81,14 @@ class PTBXL(Dataset):
             if self.label_map is None:
                 all_labels = sorted({k for d in parsed for k in d})
                 self.label_map = {k: i for i, k in enumerate(all_labels)}
+                # NOTE: pass label_map=train_dataset.label_map to val/test datasets
+                # so all splits share the same label ordering.
 
             self.labels = [self._labels_to_vector(d) for d in parsed]
 
         if target_length is None:
-            first_signal, _ = wfdb.rdsamp(os.path.join(self.root, self.records[0]))
-            self.target_length = int(first_signal.shape[0])
+            header = wfdb.rdheader(os.path.join(self.root, self.records[0]))
+            self.target_length = int(header.sig_len)
         else:
             self.target_length = int(target_length)
 
@@ -97,17 +99,18 @@ class PTBXL(Dataset):
         signal, _ = wfdb.rdsamp(os.path.join(self.root, self.records[idx]))
         x = torch.tensor(signal, dtype=torch.float32).T  # (12, T)
 
-        if x.shape[1] > self.target_length:
-            x = x[:, : self.target_length]
-        elif x.shape[1] < self.target_length:
-            pad_len = self.target_length - x.shape[1]
-            x = torch.cat([x, torch.zeros((x.shape[0], pad_len), dtype=x.dtype)], dim=1)
-
         if self.normalize:
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
             mean = x.mean(dim=1, keepdim=True)
             std = x.std(dim=1, keepdim=True).clamp(min=1e-6)
             x = (x - mean) / std
+
+        # Truncate or zero-pad AFTER normalization so padding zeros represent the mean
+        if x.shape[1] > self.target_length:
+            x = x[:, : self.target_length]
+        elif x.shape[1] < self.target_length:
+            pad_len = self.target_length - x.shape[1]
+            x = torch.cat([x, torch.zeros((x.shape[0], pad_len), dtype=x.dtype)], dim=1)
 
         if not self.return_text:
             if self.return_labels:
@@ -205,14 +208,11 @@ class PTBXL(Dataset):
         sex = self._fmt_sex(row.get("sex"))
         height = self._fmt_int(row.get("height"), None)
         weight = self._fmt_int(row.get("weight"), "unknown")
-        axis = self._fmt_text(row.get("heart_axis"), None)
         pacemaker = self._to_bool(row.get("pacemaker"))
 
         parts = [f"{age}-year-old {sex}", f"weight {weight} kg"]
         if height is not None:
             parts.append(f"height {height} cm")
-        if axis is not None:
-            parts.append(f"axis {axis}")
         parts.append("pacemaker present" if pacemaker else "no pacemaker")
         return ". ".join(parts) + "."
 
@@ -236,9 +236,9 @@ class PTBXL(Dataset):
         try:
             code = int(float(value))
             if code == 0:
-                return "female"
-            if code == 1:
                 return "male"
+            if code == 1:
+                return "female"
             return "unknown"
         except (TypeError, ValueError):
             text = str(value).strip().lower()

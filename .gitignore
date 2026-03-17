@@ -1,5 +1,23 @@
 __pycache__/
 *.pyc
+#data
+data/records100
+data/records500
+data/example_physionet.py   
+data/LICENSE.txt
+data/RECORDS
+data/ptbxl_database.csv
+data/ptbxl_v102_changelog.txt
+data/ptbxl_v103_changelog.txt
+data/robots.txt
+data/scp_statements.csv
+data/SHA256SUMS.txt
+
+
+ts2vec.py
+ts2vec/
+ts2vec_models/
+ts2vec_utils.py
 
 # Training/evaluation artifacts
 checkpoints/

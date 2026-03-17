@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from ts2vec.ts2vec import TS2Vec
 
 
@@ -27,6 +26,8 @@ class TS2VecEncoder(nn.Module):
             else:
                 self.ts2vec_net.load_state_dict(self.model.net.state_dict())
         self.output_dim = 320
+        # Learned attention weights for global pooling (differentiable, semantics-aware)
+        self.attn_pool = nn.Linear(320, 1, bias=False)
 
     def forward(self, x):
         """
@@ -56,13 +57,13 @@ class TS2VecEncoder(nn.Module):
         # Timestamp-level tokens
         token_repr = self.ts2vec_net(x, mask=self.mask_mode)  # (B, T, 320)
 
-        # Global representation (max pool over time)
-        global_repr = F.max_pool1d(
-            token_repr.transpose(1, 2),
-            kernel_size=token_repr.size(1)
-        ).transpose(1, 2)  # (B, 1, 320)
+        # Global representation via learned attention pooling
+        # (contrastive loss gradient can teach which time steps matter semantically)
+        scores = self.attn_pool(token_repr)                          # (B, T, 1)
+        weights = torch.softmax(scores, dim=1)                       # (B, T, 1)
+        global_repr = (token_repr * weights).sum(dim=1, keepdim=True)  # (B, 1, 320)
 
-        # Add CLS token in front
+        # Prepend global token
         tokens = torch.cat([global_repr, token_repr], dim=1)
 
         return tokens

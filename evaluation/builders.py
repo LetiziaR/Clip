@@ -86,7 +86,7 @@ def build_model(args, device):
         temperature=args.temperature,
     ).to(device)
 
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     print(f"Loaded checkpoint: {args.checkpoint_path}")
 
@@ -98,7 +98,6 @@ def build_trainer(args, model, generation_tokenizer, encoder_tokenizer):
     return CoCaTrainer(
         model=model,
         optimizer=optimizer,
-        accelerator=None,
         max_epochs=1,
         pad_token_id=(generation_tokenizer.pad_token_id if args.dual_tokenizer else encoder_tokenizer.pad_token_id),
         save_dir=None,

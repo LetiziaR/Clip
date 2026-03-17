@@ -131,13 +131,16 @@ class PatchTSTEncoder(nn.Module):
             return x_bt
 
         if x_bt.size(1) > model_context_length:
-            # Keep most recent context window when sequence is too long.
-            return x_bt[:, -model_context_length:, :]
+            # Keep first window to preserve ECG onset information (P-wave, initial QRS).
+            return x_bt[:, :model_context_length, :]
 
-        # Left-pad with zeros when sequence is too short.
+        # Right-pad with zeros when sequence is too short.
+        # Signal always starts at position 0, matching the truncation convention above
+        # (which preserves the first window). Left-padding would push the ECG onset to
+        # position pad_len, conflicting with PatchTST's learned positional embeddings.
         pad_len = model_context_length - x_bt.size(1)
         pad = x_bt.new_zeros(x_bt.size(0), pad_len, x_bt.size(2))
-        return torch.cat([pad, x_bt], dim=1)
+        return torch.cat([x_bt, pad], dim=1)
 
     def _run_patchtst(self, x_bt):
         try:
@@ -156,6 +159,15 @@ class PatchTSTEncoder(nn.Module):
         outputs = self._run_patchtst(x_bt)
 
         token_repr = self._extract_tokens(outputs)
+
+        # HuggingFace PatchTSTModel returns last_hidden_state with shape
+        # (B, num_channels, num_patches, d_model) — 4D, channel-independent mode.
+        # CoCa expects a flat sequence of tokens (B, L, d_model), so we merge the
+        # channel and patch dimensions. Each (channel, patch) pair becomes one token,
+        # giving the decoder full access to every patch of every ECG lead.
+        if token_repr.ndim == 4:
+            B, C, P, D = token_repr.shape
+            token_repr = token_repr.reshape(B, C * P, D)   # (B, C*P, d_model)
 
         # Project patch tokens and prepend one global summary token.
         token_repr = self.proj(token_repr)

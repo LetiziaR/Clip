@@ -21,9 +21,6 @@ class BioGPTDecoder(nn.Module):
 
         self._patch_prepare_inputs_for_generation()
 
-        if not getattr(self.model.config, "add_cross_attention", False):
-            raise ValueError("BioGPTDecoder requires add_cross_attention=True for ECG conditioning")
-
         self.project_ecg = nn.Linear(ecg_dim, self.model.config.hidden_size)
 
     def _patch_prepare_inputs_for_generation(self):
@@ -34,27 +31,25 @@ class BioGPTDecoder(nn.Module):
             input_ids,
             past_key_values=None,
             attention_mask=None,
-            inputs_embeds=None,
-            cache_position=None,
-            is_first_iteration=False,
             encoder_hidden_states=None,
             encoder_attention_mask=None,
             **kwargs,
         ):
-            if encoder_hidden_states is not None:
-                kwargs["encoder_hidden_states"] = encoder_hidden_states
-            if encoder_attention_mask is not None:
-                kwargs["encoder_attention_mask"] = encoder_attention_mask
-
-            return original_prepare(
+            result = original_prepare(
                 input_ids=input_ids,
                 past_key_values=past_key_values,
                 attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                cache_position=cache_position,
-                is_first_iteration=is_first_iteration,
                 **kwargs,
             )
+            # Explicitly inject ECG features into the returned dict so they are
+            # passed to forward() at every generation step (including steps 2+
+            # when past_key_values is active). Without this, HuggingFace's
+            # generate loop drops them after the first token.
+            if encoder_hidden_states is not None:
+                result["encoder_hidden_states"] = encoder_hidden_states
+            if encoder_attention_mask is not None:
+                result["encoder_attention_mask"] = encoder_attention_mask
+            return result
 
         self.model.prepare_inputs_for_generation = types.MethodType(
             patched_prepare_inputs_for_generation,

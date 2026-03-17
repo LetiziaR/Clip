@@ -1,3 +1,4 @@
+import warnings
 import torch
 import torch.nn as nn
 from transformers import GPT2Config
@@ -88,11 +89,17 @@ class GPT2Decoder(nn.Module):
         if start_token_id is None:
             start_token_id = self.model.config.bos_token_id
         if start_token_id is None:
-            start_token_id = eos_token_id
+            start_token_id = pad_token_id   # prefer pad over eos as start token
         if start_token_id is None:
-            start_token_id = pad_token_id
+            start_token_id = eos_token_id   # last resort
         if start_token_id is None:
             raise ValueError("GPT2Decoder.generate requires bos/eos/pad token id")
+        if eos_token_id is not None and start_token_id == eos_token_id:
+            warnings.warn(
+                f"GPT2Decoder.generate: start_token_id equals eos_token_id ({eos_token_id}). "
+                "Generation may terminate immediately. Pass an explicit bos_token_id to avoid this.",
+                UserWarning,
+            )
 
         batch_size = ecg_proj.size(0)
         decoder_input_ids = torch.full(

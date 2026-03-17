@@ -9,7 +9,6 @@ class CoCaTrainer:
         self,
         model,
         optimizer,
-        accelerator,
         max_epochs,
         pad_token_id=0,
         save_dir=None,
@@ -20,15 +19,14 @@ class CoCaTrainer:
     ):
 
         # Store core training components
-        self.model = model                    
+        self.model = model
         self.optimizer = optimizer            # Optimizer
-        self.accelerator = accelerator        # For distributed/multi-device setups
         self.max_epochs = max_epochs
         self.pad_token_id = pad_token_id      # Padding token ID for text
         self.save_dir = save_dir              # Directory to save checkpoints
         self.save_name = save_name            # Filename for checkpoints
-        self.save_best_only = save_best_only  
-        self.best_loss = float("inf")         
+        self.save_best_only = save_best_only
+        self.best_loss = float("inf")
         self.scheduler = scheduler            # Optional learning rate scheduler
 
 
@@ -101,8 +99,11 @@ class CoCaTrainer:
 
         total_loss = 0.0
 
-        for batch in data_loader:
+        for batch_idx, batch in enumerate(data_loader):
             x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask = self._prepare_batch(batch, device)
+
+            # Zero gradients before forward pass (standard order: zero → forward → backward → step)
+            self.optimizer.zero_grad()
 
             # Forward pass
             loss = self.model(
@@ -114,14 +115,35 @@ class CoCaTrainer:
                 decoder_attention_mask=decoder_attn_mask,
                 return_loss=True,
             )
-            
-            # Backpropagation
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            total_loss += loss.item()
-        avg_loss = total_loss / len(data_loader)
 
+            # Catch NaN/Inf loss before backward — if not caught, backward silently
+            # propagates NaN through all gradients and corrupts every parameter.
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise RuntimeError(
+                    f"Loss is {loss.item()} at epoch {epoch}, batch {batch_idx}. "
+                    "Check for NaN in inputs or logit scale explosion."
+                )
+
+            # Backpropagation
+            loss.backward()
+
+            # Gradient clipping — transformer cross-attention layers (BART/T5/BioGPT)
+            # can produce large gradient spikes early in training. Clipping prevents
+            # a single bad batch from corrupting all model weights.
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+            self.optimizer.step()
+
+            # Step the learning rate scheduler if one was provided
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            total_loss += loss.item()
+
+        if len(data_loader) == 0:
+            return float("inf")
+
+        avg_loss = total_loss / len(data_loader)
 
         # Model Saving 
         if self.save_dir is not None:
@@ -194,4 +216,5 @@ class CoCaTrainer:
         if len(data_loader) == 0:
             return float("inf")
 
-        return total_loss / len(data_loader)
+        avg_loss = total_loss / len(data_loader)
+        return avg_loss
