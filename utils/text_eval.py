@@ -12,10 +12,10 @@ _CLINICAL_CONCEPT_PATTERNS = {
     "atrial_flutter": [r"\batrial flutter\b", r"\bvorhofflattern\b"],
     "rbbb": [r"\bright bundle branch block\b", r"\brechtsschenkelblock\b"],
     "lbbb": [r"\bleft bundle branch block\b", r"\blinksschenkelblock\b"],
-    "lafb": [r"\bleft anterior fascicular block\b", r"\blinkstyp\b", r"\bleft axis deviation\b"],
+    "left_axis_deviation": [r"\bleft anterior fascicular block\b", r"\blinkstyp\b", r"\bleft axis deviation\b"],
     "av_block": [r"\bav block\b", r"\batrioventricular block\b", r"\bav-block\b"],
-    "myocardial_infarction": [r"\bmyocardial infarction\b", r"\binfarkt\b", r"\bmyokardschaden\b"],
-    "ischemia": [r"\bischemi\w*\b", r"\bischaemi\w*\b", r"\bst depression\b", r"\bst elevation\b"],
+    "myocardial_infarction": [r"\bmyocardial infarction\b", r"\binfarkt\b", r"\bmyokardschaden\b", r"\bst elevation\b"],
+    "ischemia": [r"\bischemi\w*\b", r"\bischaemi\w*\b", r"\bst depression\b"],
     "lvh": [r"\bleft ventricular hypertrophy\b", r"\blvh\b", r"\blinksbelastung\b"],
 }
 
@@ -61,9 +61,9 @@ def _compute_bertscore(
         verbose=False,
     )
     return {
-        "bertscore_precision": float(precision.mean().item()),
-        "bertscore_recall": float(recall.mean().item()),
-        "bertscore_f1": float(f1.mean().item()),
+        "bertscore_precision": precision.mean().item(),
+        "bertscore_recall": recall.mean().item(),
+        "bertscore_f1": f1.mean().item(),
     }
 
 
@@ -108,7 +108,6 @@ def _compute_clinical_concept_micro_metrics(predictions, references):
 
 
 def _tokenize(text):
-    text = _normalize_text(text)
     if not text:
         return []
     return text.split(" ")
@@ -138,8 +137,6 @@ def _bleu_n(pred_tokens, ref_tokens, n):
 
     pred_len = len(pred_tokens)
     ref_len = len(ref_tokens)
-    if pred_len == 0:
-        return 0.0
 
     if pred_len > ref_len:
         bp = 1.0
@@ -202,7 +199,6 @@ def compute_text_generation_metrics(
             "clinical_concept_f1": 0.0,
         }
         if full_metrics:
-            metrics["exact_match"] = 0.0
             metrics["bleu1"] = 0.0
             metrics["bleu2"] = 0.0
             metrics["meteor"] = 0.0
@@ -212,7 +208,6 @@ def compute_text_generation_metrics(
             metrics["bertscore_f1"] = 0.0
         return metrics
 
-    exact_match = 0
     bleu1_sum = 0.0
     bleu2_sum = 0.0
     rouge_l_sum = 0.0
@@ -222,9 +217,6 @@ def compute_text_generation_metrics(
     for pred_text, ref_text in zip(predictions, references):
         pred_norm = _normalize_text(pred_text)
         ref_norm = _normalize_text(ref_text)
-
-        if full_metrics and pred_norm == ref_norm:
-            exact_match += 1
 
         pred_tokens = _tokenize(pred_norm)
         ref_tokens = _tokenize(ref_norm)
@@ -246,7 +238,6 @@ def compute_text_generation_metrics(
     }
 
     if full_metrics:
-        metrics["exact_match"] = exact_match / total
         metrics["bleu1"] = bleu1_sum / total
         metrics["bleu2"] = bleu2_sum / total
 

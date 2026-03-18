@@ -4,7 +4,7 @@ import random
 import numpy as np
 import torch
 
-from evaluation.builders import build_model, build_test_loader, build_tokenizers, build_trainer
+from evaluation.builders import build_model, build_test_loader, build_tokenizers, compute_test_loss
 from evaluation.generation import evaluate_generation
 from evaluation.io_utils import save_generations_jsonl, save_json
 
@@ -25,22 +25,21 @@ def run_evaluation(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    encoder_tokenizer, generation_tokenizer, reference_tokenizer = build_tokenizers(args)
+    encoder_tokenizer, generation_tokenizer = build_tokenizers(args)
     test_loader = build_test_loader(args, encoder_tokenizer, generation_tokenizer)
 
     model = build_model(args, device)
-    trainer = build_trainer(args, model, generation_tokenizer, encoder_tokenizer)
 
     test_loss = None
     if not args.skip_test_loss:
-        test_loss = trainer.evaluate(test_loader)
+        test_loss = compute_test_loss(model, test_loader, device)
         print(f"Test loss: {test_loss:.4f}")
 
     generation_metrics, predictions, references = evaluate_generation(
         model=model,
         data_loader=test_loader,
         generation_tokenizer=generation_tokenizer,
-        reference_tokenizer=reference_tokenizer,
+        reference_tokenizer=generation_tokenizer,
         max_new_tokens=args.gen_max_new_tokens,
         num_beams=args.gen_num_beams,
         do_sample=args.gen_do_sample,

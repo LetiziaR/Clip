@@ -4,7 +4,7 @@
 #SBATCH --partition=mcml-dgx-a100-40x8
 #SBATCH --qos=mcml
 #SBATCH --time=08:00:00
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=40G
 
@@ -22,7 +22,7 @@ echo "[INFO] python=$(python --version 2>&1)"
 echo "[INFO] date=$(date -Iseconds)"
 nvidia-smi || true
 
-python -X faulthandler -u run_coca.py \
+torchrun --nproc_per_node=gpu python -X faulthandler -u run_coca.py \
   --run_name coca_best_lr1e4_bs32_temp007_pseudo_to_report \
   --learning_rate 1e-4 \
   --batch_size 32 \

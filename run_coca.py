@@ -1,6 +1,7 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 import os
 import csv
@@ -13,6 +14,18 @@ from datetime import datetime
 from data.ptbxl_dataset import PTBXL
 from models.coca import CoCa
 from trainer.coca_trainer import CoCaTrainer
+
+
+def init_distributed_mode():
+    """Initialize distributed training if running under torchrun."""
+    rank = int(os.environ.get("RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", -1))
+
+    if rank == -1:  # torchrun not detected
+        return False
+
+    torch.distributed.init_process_group(backend="nccl")
+    return True
 
 
 def parse_args():
@@ -36,6 +49,7 @@ def parse_args():
     parser.add_argument("--projection_dim", type=int, default=128)
     parser.add_argument("--caption_loss_weight", type=float, default=1.0)
     parser.add_argument("--contrastive_loss_weight", type=float, default=1.0)
+    parser.add_argument("--classification_loss_weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--sampling_rate", type=int, default=500, choices=[100, 500])
@@ -116,14 +130,27 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Initialize distributed training if running under torchrun
+    is_distributed = init_distributed_mode()
+    rank = dist.get_rank() if is_distributed else 0
+    world_size = dist.get_world_size() if is_distributed else 1
+
+    # Assign each rank to a specific GPU (critical for DDP!)
+    if is_distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     train_folds = [1, 2, 3, 4, 5, 6, 7, 8]
     val_folds = [9]
     test_folds = [10]
 
     run_name = get_run_name(args)
     run_dir = os.path.join(args.checkpoint_dir, run_name)
-    os.makedirs(run_dir, exist_ok=True)
+    if rank == 0:  # Only rank-0 creates the directory
+        os.makedirs(run_dir, exist_ok=True)
 
     encoder_tokenizer = AutoTokenizer.from_pretrained(args.language_model_path)
     if encoder_tokenizer.pad_token is None:
@@ -199,31 +226,50 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        ),
         num_workers=args.num_workers,
-        drop_last=True,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        sampler=DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            seed=args.seed,
+            drop_last=False,
+        ),
         num_workers=args.num_workers,
-        drop_last=False,
     )
 
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        sampler=DistributedSampler(
+            test_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            seed=args.seed,
+            drop_last=False,
+        ),
         num_workers=args.num_workers,
-        drop_last=False,
     )
 
-    print(f"Run: {run_name}")
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
-    print(f"Test samples: {len(test_dataset)}")
+    if rank == 0:
+        print(f"Run: {run_name}")
+        print(f"Train samples: {len(train_dataset)}")
+        print(f"Val samples: {len(val_dataset)}")
+        print(f"Test samples: {len(test_dataset)}")
 
     model = CoCa(
         ts_arch=args.ts_arch,
@@ -237,8 +283,14 @@ def main():
         projection_dim=args.projection_dim,
         caption_loss_weight=args.caption_loss_weight,
         contrastive_loss_weight=args.contrastive_loss_weight,
+        classification_loss_weight=args.classification_loss_weight,
+        num_classes=(len(shared_label_map) if shared_label_map is not None else 0),
         temperature=args.temperature,
     ).to(device)
+
+    # Wrap with DistributedDataParallel if distributed training is enabled
+    if is_distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model)
 
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -278,53 +330,65 @@ def main():
     config_payload["run_dir"] = run_dir
     if shared_label_map is not None:
         config_payload["num_labels"] = len(shared_label_map)
-    save_json(os.path.join(run_dir, "config.json"), config_payload)
+    if rank == 0:
+        save_json(os.path.join(run_dir, "config.json"), config_payload)
 
-    with open(metrics_csv_path, "w", newline="", encoding="utf-8") as fp:
+    if rank == 0:
+        fp = open(metrics_csv_path, "w", newline="", encoding="utf-8")
         writer = csv.writer(fp)
         writer.writerow(["epoch", "train_loss", "val_loss", "best_val_loss"])
+    else:
+        fp = None
+        writer = None
 
-        for epoch in range(1, args.epochs + 1):
-            train_loss = trainer.train_one_epoch(data_loader=train_loader, epoch=epoch)
-            val_loss = trainer.evaluate(val_loader)
-            completed_epochs = epoch
+    for epoch in range(1, args.epochs + 1):
+        train_loss = trainer.train_one_epoch(data_loader=train_loader, epoch=epoch)
+        val_loss = trainer.evaluate(val_loader)
+        completed_epochs = epoch
 
-            improved = val_loss < (best_val_loss - args.early_stopping_min_delta)
+        improved = val_loss < (best_val_loss - args.early_stopping_min_delta)
 
-            if improved:
-                best_val_loss = val_loss
-                epochs_without_improvement = 0
-                best_payload = {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "best_val_loss": best_val_loss,
-                    "config": config_payload,
-                }
-                if args.save_optimizer_state:
-                    best_payload["optimizer_state_dict"] = optimizer.state_dict()
+        if improved:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+            best_payload = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+                "config": config_payload,
+            }
+            if args.save_optimizer_state:
+                best_payload["optimizer_state_dict"] = optimizer.state_dict()
+            if rank == 0:
                 safe_save_checkpoint(best_payload, best_ckpt_path, allow_model_only_fallback=True)
-            else:
-                epochs_without_improvement += 1
+        else:
+            epochs_without_improvement += 1
 
+        if writer is not None:
             writer.writerow([epoch, f"{train_loss:.8f}", f"{val_loss:.8f}", f"{best_val_loss:.8f}"])
             fp.flush()
 
+        if rank == 0:
             print(
                 f"Epoch [{epoch}/{args.epochs}] - "
                 f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
                 f"Best Val: {best_val_loss:.4f}"
             )
 
-            if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
-                stopped_early = True
+        if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+            stopped_early = True
+            if rank == 0:
                 print(
                     "Early stopping triggered: "
                     f"no val improvement for {epochs_without_improvement} epoch(s) "
                     f"(patience={args.early_stopping_patience}, min_delta={args.early_stopping_min_delta})."
                 )
-                break
+            break
+
+    if fp is not None:
+        fp.close()
 
     last_payload = {
         "epoch": completed_epochs,
@@ -334,9 +398,10 @@ def main():
     }
     if args.save_optimizer_state:
         last_payload["optimizer_state_dict"] = optimizer.state_dict()
-    safe_save_checkpoint(last_payload, last_ckpt_path, allow_model_only_fallback=True)
+    if rank == 0:
+        safe_save_checkpoint(last_payload, last_ckpt_path, allow_model_only_fallback=True)
 
-    if os.path.exists(best_ckpt_path):
+    if rank == 0 and os.path.exists(best_ckpt_path):
         checkpoint = torch.load(best_ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
         print(f"Loaded best checkpoint from epoch {checkpoint['epoch']}")
@@ -344,9 +409,11 @@ def main():
     test_loss = None
     if not args.skip_test:
         test_loss = trainer.evaluate(test_loader)
-        print(f"Final Test Loss: {test_loss:.4f}")
+        if rank == 0:
+            print(f"Final Test Loss: {test_loss:.4f}")
     else:
-        print("Skipping test evaluation (--skip_test).")
+        if rank == 0:
+            print("Skipping test evaluation (--skip_test).")
 
     summary = {
         "run_name": run_name,
@@ -358,10 +425,16 @@ def main():
         "last_checkpoint": last_ckpt_path,
         "metrics_csv": metrics_csv_path,
     }
-    save_json(os.path.join(run_dir, "summary.json"), summary)
+    if rank == 0:
+        save_json(os.path.join(run_dir, "summary.json"), summary)
 
-    print(f"Artifacts saved in: {run_dir}")
-    print("Training finished.")
+    if rank == 0:
+        print(f"Artifacts saved in: {run_dir}")
+        print("Training finished.")
+
+    # Cleanup distributed training
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

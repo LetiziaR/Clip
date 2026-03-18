@@ -28,6 +28,14 @@ def evaluate_generation(
     predictions = []
     references = []
 
+    bos_token_id = getattr(generation_tokenizer, "bos_token_id", None)
+    eos_token_id = getattr(generation_tokenizer, "eos_token_id", None)
+    pad_token_id = getattr(generation_tokenizer, "pad_token_id", None)
+    if bos_token_id is None:
+        bos_token_id = getattr(generation_tokenizer, "cls_token_id", None)
+    if eos_token_id is None:
+        eos_token_id = getattr(generation_tokenizer, "sep_token_id", None)
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(data_loader):
             if max_batches > 0 and batch_idx >= max_batches:
@@ -45,14 +53,6 @@ def evaluate_generation(
             ts_tokens = model_ref.ts_enc(x_ts)
             ts_temporal = ts_tokens[:, 1:]   # exclude global token; matches training (B2)
 
-            bos_token_id = getattr(generation_tokenizer, "bos_token_id", None)
-            eos_token_id = getattr(generation_tokenizer, "eos_token_id", None)
-            pad_token_id = getattr(generation_tokenizer, "pad_token_id", None)
-            if bos_token_id is None:
-                bos_token_id = getattr(generation_tokenizer, "cls_token_id", None)
-            if eos_token_id is None:
-                eos_token_id = getattr(generation_tokenizer, "sep_token_id", None)
-
             generated_ids = model_ref.decoder.generate(
                 ecg_tokens=ts_temporal,
                 max_new_tokens=max_new_tokens,
@@ -65,7 +65,6 @@ def evaluate_generation(
                 pad_token_id=pad_token_id,
             )
             generated_ids = generated_ids.detach().cpu()
-            ref_ids = ref_ids.detach().cpu() if hasattr(ref_ids, "detach") else ref_ids
 
             pred_texts = generation_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
             ref_texts = reference_tokenizer.batch_decode(ref_ids, skip_special_tokens=True)

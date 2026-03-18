@@ -55,6 +55,17 @@ class CoCaTrainer:
     def _get_device(self):
         return next(self._get_model_ref().parameters()).device
 
+    def _reduce_loss(self, loss_value: float) -> float:
+        """Reduce loss across all ranks in distributed training."""
+        if not (dist.is_available() and dist.is_initialized()):
+            return loss_value
+
+        # Convert to tensor, reduce across all ranks, convert back
+        loss_tensor = torch.tensor(loss_value, device=self._get_device())
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        reduced_loss = loss_tensor.item() / dist.get_world_size()
+        return reduced_loss
+
     def _prepare_batch(self, batch, device):
         if isinstance(batch, dict):
             x_ts = batch["ecg"]
@@ -78,13 +89,18 @@ class CoCaTrainer:
         if decoder_attn_mask is not None:
             decoder_attn_mask = decoder_attn_mask.to(device)
 
+        # SCP classification labels (multi-hot) — only present when return_labels=True
+        class_labels = batch.get("labels") if isinstance(batch, dict) else None
+        if class_labels is not None:
+            class_labels = class_labels.to(device)
+
         caption_ids = decoder_input_ids if decoder_input_ids is not None else input_ids
         caption_mask = decoder_attn_mask if decoder_attn_mask is not None else attn_mask
 
         labels = caption_ids.clone()
         labels = labels.masked_fill(caption_mask == 0, -100)
 
-        return x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask
+        return x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, class_labels
 
 
     def train_one_epoch(self, data_loader, epoch):
@@ -100,7 +116,7 @@ class CoCaTrainer:
         total_loss = 0.0
 
         for batch_idx, batch in enumerate(data_loader):
-            x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask = self._prepare_batch(batch, device)
+            x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, class_labels = self._prepare_batch(batch, device)
 
             # Zero gradients before forward pass (standard order: zero → forward → backward → step)
             self.optimizer.zero_grad()
@@ -111,6 +127,7 @@ class CoCaTrainer:
                 input_ids,
                 attn_mask,
                 labels=labels,
+                class_labels=class_labels,
                 decoder_input_ids=decoder_input_ids,
                 decoder_attention_mask=decoder_attn_mask,
                 return_loss=True,
@@ -144,6 +161,9 @@ class CoCaTrainer:
             return float("inf")
 
         avg_loss = total_loss / len(data_loader)
+
+        # Reduce loss across all ranks for logging
+        avg_loss = self._reduce_loss(avg_loss)
 
         # Model Saving 
         if self.save_dir is not None:
@@ -201,12 +221,13 @@ class CoCaTrainer:
 
         with torch.no_grad():
             for batch in data_loader:
-                x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask = self._prepare_batch(batch, device)
+                x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, class_labels = self._prepare_batch(batch, device)
                 loss = self.model(
                     x_ts,
                     input_ids,
                     attn_mask,
                     labels=labels,
+                    class_labels=class_labels,
                     decoder_input_ids=decoder_input_ids,
                     decoder_attention_mask=decoder_attn_mask,
                     return_loss=True,
@@ -217,4 +238,8 @@ class CoCaTrainer:
             return float("inf")
 
         avg_loss = total_loss / len(data_loader)
+
+        # Reduce loss across all ranks for logging
+        avg_loss = self._reduce_loss(avg_loss)
+
         return avg_loss

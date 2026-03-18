@@ -27,6 +27,8 @@ class CoCa(nn.Module):
         projection_dim: int,
         caption_loss_weight: float = 1.0,
         contrastive_loss_weight: float = 1.0,
+        classification_loss_weight: float = 0.5,
+        num_classes: int = 0,
         temperature: float = 0.07,
     ):
         super().__init__()
@@ -34,9 +36,9 @@ class CoCa(nn.Module):
         self.projection_dim = projection_dim
         self.caption_loss_weight = caption_loss_weight
         self.contrastive_loss_weight = contrastive_loss_weight
+        self.classification_loss_weight = classification_loss_weight
 
-        # Embedding dimensions 
-
+        # Embedding dimensions
         if ts_arch in ["ts2vec", "patchtst"]:
             self.ts_emb_dim = 320
         else:
@@ -79,6 +81,13 @@ class CoCa(nn.Module):
             projection_dim=self.projection_dim
         )
 
+        # Auxiliary classification head on ts_global (optional)
+        # Trains the TS encoder to be disease-discriminative, which improves
+        # the temporal token representations used by the decoder.
+        self.classification_head = (
+            nn.Linear(self.ts_emb_dim, num_classes) if num_classes > 0 else None
+        )
+
         # Contrastive loss
         self.contrastive_loss = ContrastiveLoss()
 
@@ -87,27 +96,24 @@ class CoCa(nn.Module):
             torch.tensor(1 / temperature).log()
         )
 
-    # Forward
     def forward(
         self,
         x_ts: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
         return_loss: bool = False,
         return_embeddings: bool = False,
     ):
-
         # Time-series encoding (always needed)
         ts_tokens = self.ts_enc(x_ts)           # (B, L+1, 320)
-        ts_global = ts_tokens[:, 0]             # global token for contrastive branch
-        ts_temporal = ts_tokens[:, 1:]          # temporal tokens for decoder branch only
+        ts_global = ts_tokens[:, 0]             # global token for contrastive + classification
+        ts_temporal = ts_tokens[:, 1:]          # temporal tokens for decoder
 
         # Contrastive branch — skipped during generation-only inference
-        # (return_loss=False, return_embeddings=False) to avoid running a full
-        # BioClinicalBERT forward pass that produces no output used by the caller.
         if return_loss or return_embeddings:
             lang_out = self.language_enc(
                 input_ids=input_ids,
@@ -124,10 +130,6 @@ class CoCa(nn.Module):
                 return ts_proj, text_proj
 
         # Decoder input IDs must come from the decoder's own tokenizer vocabulary.
-        # Falling back to encoder (BioClinicalBERT) input_ids is only safe for
-        # BART/T5 when labels are provided (decoder auto-shifts from labels and
-        # ignores input_ids). For BioGPT/GPT-2 the input_ids are used directly —
-        # passing the wrong vocabulary will produce garbage outputs.
         if decoder_input_ids is None:
             warnings.warn(
                 "CoCa.forward: decoder_input_ids is None, falling back to encoder "
@@ -152,8 +154,7 @@ class CoCa(nn.Module):
         if not return_loss:
             return decoder_outputs
 
-        # Caption loss — decoder_outputs.loss is None when labels was not passed,
-        # which would cause a silent TypeError in the weighted sum below.
+        # Caption loss
         caption_loss = decoder_outputs.loss
         if caption_loss is None:
             raise ValueError(
@@ -161,7 +162,7 @@ class CoCa(nn.Module):
                 "decoder_outputs.loss is None — pass labels to the forward call."
             )
 
-        # B4: clamp logit scale to prevent NaN from exploding logits
+        # Contrastive loss
         self.log_logit_scale.data.clamp_(max=math.log(100))
         contrastive_loss = self.contrastive_loss(
             ts_proj,
@@ -173,5 +174,15 @@ class CoCa(nn.Module):
             self.caption_loss_weight * caption_loss +
             self.contrastive_loss_weight * contrastive_loss
         )
+
+        # Auxiliary classification loss — only when the head exists and labels are provided.
+        # Gradients flow through ts_global → attention pooling → ts2vec backbone,
+        # forcing the shared temporal representations to be disease-discriminative.
+        if self.classification_head is not None and class_labels is not None:
+            class_logits = self.classification_head(ts_global)
+            classification_loss = F.binary_cross_entropy_with_logits(
+                class_logits, class_labels
+            )
+            total_loss = total_loss + self.classification_loss_weight * classification_loss
 
         return total_loss

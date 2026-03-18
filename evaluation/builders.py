@@ -4,7 +4,6 @@ from transformers import AutoTokenizer
 
 from data.ptbxl_dataset import PTBXL
 from models.coca import CoCa
-from trainer.coca_trainer import CoCaTrainer
 
 
 def build_tokenizers(args):
@@ -13,7 +12,6 @@ def build_tokenizers(args):
         encoder_tokenizer.pad_token = encoder_tokenizer.eos_token
 
     generation_tokenizer = encoder_tokenizer
-    reference_tokenizer = encoder_tokenizer
 
     if args.dual_tokenizer:
         decoder_tok_path = args.decoder_tokenizer_path
@@ -22,14 +20,10 @@ def build_tokenizers(args):
         if decoder_tok_path is None:
             if args.decoder_arch == "bart":
                 decoder_tok_path = "facebook/bart-base"
-            elif args.decoder_arch == "mbart":
-                decoder_tok_path = "facebook/mbart-large-50-many-to-many-mmt"
             elif args.decoder_arch == "gpt2":
                 decoder_tok_path = "gpt2"
             elif args.decoder_arch == "biogpt":
                 decoder_tok_path = "microsoft/biogpt"
-            elif args.decoder_arch == "mt5":
-                decoder_tok_path = "google/mt5-base"
             else:
                 decoder_tok_path = "google/flan-t5-base"
 
@@ -38,13 +32,25 @@ def build_tokenizers(args):
             generation_tokenizer.pad_token = generation_tokenizer.eos_token
         if args.decoder_arch in ["gpt2", "biogpt"]:
             generation_tokenizer.padding_side = "left"
-        reference_tokenizer = generation_tokenizer
 
-    return encoder_tokenizer, generation_tokenizer, reference_tokenizer
+    return encoder_tokenizer, generation_tokenizer
 
 
 def build_test_loader(args, encoder_tokenizer, generation_tokenizer):
-    test_folds = [10]
+    # Build the label_map from training folds so label ordering is consistent
+    # with what the model was trained on. Fold 10 alone may be missing some labels.
+    label_map = None
+    if args.return_labels:
+        ref_dataset = PTBXL(
+            root=args.data_root,
+            folds=list(range(1, 9)),
+            sampling_rate=args.sampling_rate,
+            return_text=False,
+            return_labels=True,
+            label_col=args.label_col,
+            label_threshold=args.label_threshold,
+        )
+        label_map = ref_dataset.label_map
 
     test_dataset = PTBXL(
         root=args.data_root,
@@ -53,12 +59,13 @@ def build_test_loader(args, encoder_tokenizer, generation_tokenizer):
         decoder_tokenizer=(generation_tokenizer if args.dual_tokenizer else None),
         use_dual_tokenizer=args.dual_tokenizer,
         sampling_rate=args.sampling_rate,
-        folds=test_folds,
+        folds=[10],
         text_max_length=args.text_max_length,
         text_source=args.text_source,
         return_labels=args.return_labels,
         label_col=args.label_col,
         label_threshold=args.label_threshold,
+        label_map=label_map,
     )
 
     return DataLoader(
@@ -67,10 +74,16 @@ def build_test_loader(args, encoder_tokenizer, generation_tokenizer):
         shuffle=False,
         num_workers=args.num_workers,
         drop_last=False,
+        pin_memory=True,
     )
 
 
 def build_model(args, device):
+    # Read checkpoint first so we can recover num_classes that was used during training.
+    # run_coca.py saves this as "num_labels" inside the checkpoint's config dict.
+    checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=True)
+    num_classes = checkpoint.get("config", {}).get("num_labels", 0)
+
     model = CoCa(
         ts_arch=args.ts_arch,
         language_arch=args.language_arch,
@@ -83,24 +96,47 @@ def build_model(args, device):
         projection_dim=args.projection_dim,
         caption_loss_weight=args.caption_loss_weight,
         contrastive_loss_weight=args.contrastive_loss_weight,
+        classification_loss_weight=args.classification_loss_weight,
+        num_classes=num_classes,
         temperature=args.temperature,
     ).to(device)
 
-    checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Loaded checkpoint: {args.checkpoint_path}")
+    model.eval()
+    print(f"Loaded checkpoint: {args.checkpoint_path} (num_classes={num_classes})")
 
     return model
 
 
-def build_trainer(args, model, generation_tokenizer, encoder_tokenizer):
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    return CoCaTrainer(
-        model=model,
-        optimizer=optimizer,
-        max_epochs=1,
-        pad_token_id=(generation_tokenizer.pad_token_id if args.dual_tokenizer else encoder_tokenizer.pad_token_id),
-        save_dir=None,
-        save_name="unused",
-        save_best_only=False,
-    )
+def compute_test_loss(model, loader, device):
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            x_ts = batch["ecg"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attn_mask = batch["attention_mask"].to(device)
+            decoder_input_ids = batch.get("decoder_input_ids")
+            decoder_attn_mask = batch.get("decoder_attention_mask")
+            if decoder_input_ids is not None:
+                decoder_input_ids = decoder_input_ids.to(device)
+            if decoder_attn_mask is not None:
+                decoder_attn_mask = decoder_attn_mask.to(device)
+            caption_ids = decoder_input_ids if decoder_input_ids is not None else input_ids
+            caption_mask = decoder_attn_mask if decoder_attn_mask is not None else attn_mask
+            labels = caption_ids.clone().masked_fill(caption_mask == 0, -100)
+            class_labels = batch.get("labels")
+            if class_labels is not None:
+                class_labels = class_labels.to(device)
+            loss = model(
+                x_ts, input_ids, attn_mask,
+                labels=labels,
+                class_labels=class_labels,
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attn_mask,
+                return_loss=True,
+            )
+            total_loss += loss.item()
+    if len(loader) == 0:
+        return float("inf")
+    return total_loss / len(loader)

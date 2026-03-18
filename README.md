@@ -204,6 +204,65 @@ python run_coca.py \
   --temperature 0.07
 ```
 
+### Distributed Data Parallelism (Multi-GPU Training)
+
+To accelerate training across multiple GPUs on a single node or cluster:
+
+**Requirements:**
+- PyTorch >= 1.12 (already in `requirements.txt`)
+- NVIDIA NCCL library (comes with CUDA)
+
+**Single Node — All Available GPUs:**
+
+```bash
+torchrun --nproc_per_node=gpu run_coca.py \
+  --data_root /path/to/ptbxl \
+  --ts_model_path ts2vec_pretrained.pt \
+  --checkpoint_dir /path/to/checkpoints \
+  --batch_size 32 \
+  --epochs 20 \
+  [other args]
+```
+
+This automatically detects all GPUs and distributes data across them. For example, with 8 GPUs and `batch_size=32`, each GPU receives 4 samples.
+
+**Specific GPU Count:**
+
+```bash
+torchrun --nproc_per_node=4 run_coca.py [args]  # Use exactly 4 GPUs
+```
+
+**Via SLURM (Recommended for HPC):**
+
+```bash
+# Request 8 GPUs and submit
+sbatch train_best_coca.slurm
+```
+
+The SLURM script is already configured for 8-GPU training:
+- `--gres=gpu:8` allocates 8 GPUs
+- Uses `torchrun --nproc_per_node=gpu` to auto-detect available GPUs
+
+**Key Notes:**
+
+- **Effective batch size** = `per_gpu_batch_size × num_gpus`. With the default config above: 32 × 8 = 256.
+- **Learning rate scaling**: May need to scale learning rate proportionally with batch size (e.g., `--learning_rate 8e-4` for 8 GPUs if using linear scaling).
+- **Backward compatible**: Single-GPU training still works without `torchrun`:
+  ```bash
+  python run_coca.py --batch_size 32 [args]
+  ```
+- **Checkpoints**: Automatically compatible with single-GPU inference (no converter needed).
+- **Metrics**: Loss values are automatically synchronized across ranks for accurate logging.
+- **Data distribution**: `DistributedSampler` ensures no data duplication across GPUs.
+
+**Monitoring GPU Usage:**
+
+```bash
+watch nvidia-smi  # Watch in separate terminal
+```
+
+You should see multiple Python processes (one per GPU), each using ~1/N of the total VRAM (where N = number of GPUs).
+
 ### Full argument reference
 
 | Argument | Default | Description |
@@ -335,16 +394,33 @@ python plot_losses.py \
 Submit to an HPC cluster with NVIDIA A100 GPUs:
 
 ```bash
-# Training
+# Training (8 GPUs, auto-detected via torchrun)
 sbatch train_best_coca.slurm
 
-# Evaluation (pass eval args after --)
+# Evaluation (single GPU)
 sbatch eval_coca_generation.slurm \
   --checkpoint_path /path/to/best.pt \
   --output_dir /path/to/eval
 ```
 
-Resource profile for both jobs: 1 × A100-40 GB, 4 CPUs, 8 h (train) / 2 h (eval).
+**Resource profiles:**
+- **Training job** (`train_best_coca.slurm`): 8 × A100-40 GB, 4 CPUs, 8 h
+  - Uses `torchrun --nproc_per_node=gpu` for automatic multi-GPU distribution
+  - Effective batch size = 32 × 8 = 256 samples/step
+  - Checkpoints compatible with single-GPU evaluation
+- **Evaluation job** (`eval_coca_generation.slurm`): 1 × A100-40 GB, 4 CPUs, 2 h
+
+**Customizing GPU count:**
+
+Edit `train_best_coca.slurm`:
+```bash
+#SBATCH --gres=gpu:4         # Change to 4 GPUs instead of 8
+```
+
+Or override at submission:
+```bash
+sbatch --gres=gpu:4 train_best_coca.slurm
+```
 
 ---
 

@@ -21,6 +21,7 @@ ts2vec_utils.py
 
 # Training/evaluation artifacts
 checkpoints/
+eval_results/
 logs/
 slurm-*.out
 *.log

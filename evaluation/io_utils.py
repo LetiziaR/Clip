@@ -3,7 +3,7 @@ import json
 
 def save_json(path, payload):
     with open(path, "w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
+        json.dump(payload, fp, indent=2, ensure_ascii=False)
 
 
 def save_generations_jsonl(path, predictions, references):
@@ -14,4 +14,4 @@ def save_generations_jsonl(path, predictions, references):
                 "prediction": pred,
                 "reference": ref,
             }
-            fp.write(json.dumps(item, ensure_ascii=True) + "\n")
+            fp.write(json.dumps(item, ensure_ascii=False) + "\n")

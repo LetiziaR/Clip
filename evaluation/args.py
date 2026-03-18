@@ -3,7 +3,7 @@ import argparse
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate CoCa checkpoint (test loss + generation)")
-    parser.add_argument("--data_root", type=str, default="/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ra59ver2/ptb-xl-project/files/ptb-xl/1.0.3")
+    parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--language_model_path", type=str, default="emilyalsentzer/Bio_ClinicalBERT")
     parser.add_argument("--decoder_model_path", type=str, default=None)
     parser.add_argument("--decoder_tokenizer_path", type=str, default=None)
@@ -13,12 +13,13 @@ def parse_args():
     parser.add_argument("--ts_model_path", type=str, default="ts2vec_pretrained.pt")
     parser.add_argument("--patchtst_pretrained_name", type=str, default=None)
     parser.add_argument("--ts_arch", type=str, default="ts2vec", choices=["ts2vec", "patchtst"])
-    parser.add_argument("--language_arch", type=str, default="bioclinicalbert")
-    parser.add_argument("--decoder_arch", type=str, default="bart", choices=["bart", "mbart", "gpt2", "t5", "mt5", "biogpt"])
+    parser.add_argument("--language_arch", type=str, default="bioclinicalbert", choices=["bert", "bioclinicalbert"])
+    parser.add_argument("--decoder_arch", type=str, default="bart", choices=["bart", "gpt2", "t5", "biogpt"])
     parser.add_argument("--head_arch", type=str, default="mlp")
     parser.add_argument("--projection_dim", type=int, default=128)
     parser.add_argument("--caption_loss_weight", type=float, default=1.0)
     parser.add_argument("--contrastive_loss_weight", type=float, default=1.0)
+    parser.add_argument("--classification_loss_weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.07)
 
     parser.add_argument("--batch_size", type=int, default=64)
