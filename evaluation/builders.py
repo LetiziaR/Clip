@@ -78,32 +78,77 @@ def build_test_loader(args, encoder_tokenizer, generation_tokenizer):
     )
 
 
+def _read_checkpoint_config(checkpoint):
+    """Extract model config from checkpoint, supporting both old and new formats."""
+    saved = checkpoint.get("config", {})
+    # New format: nested dicts with model/paths/data/training sections
+    if "model" in saved and isinstance(saved["model"], dict):
+        m = saved["model"]
+        p = saved.get("paths", {})
+        return {
+            "num_classes": m.get("num_classes", 0),
+            "ts_emb_dim": m.get("ts_emb_dim", 320),
+            "lang_emb_dim": m.get("lang_emb_dim", 768),
+            "ts_arch": m.get("ts_arch"),
+            "language_arch": m.get("language_arch"),
+            "decoder_arch": m.get("decoder_arch"),
+            "head_arch": m.get("head_arch"),
+            "projection_dim": m.get("projection_dim"),
+            "decoder_model": p.get("decoder_model"),
+        }
+    # Old format: flat dict
+    return {
+        "num_classes": saved.get("num_labels", 0),
+        "ts_emb_dim": 320,
+        "lang_emb_dim": 768,
+        "ts_arch": saved.get("ts_arch"),
+        "language_arch": saved.get("language_arch"),
+        "decoder_arch": saved.get("decoder_arch"),
+        "head_arch": saved.get("head_arch"),
+        "projection_dim": saved.get("projection_dim"),
+        "decoder_model": saved.get("decoder_model_path"),
+    }
+
+
 def build_model(args, device):
-    # Read checkpoint first so we can recover num_classes that was used during training.
-    # run_coca.py saves this as "num_labels" inside the checkpoint's config dict.
     checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=True)
-    num_classes = checkpoint.get("config", {}).get("num_labels", 0)
+    ckpt_cfg = _read_checkpoint_config(checkpoint)
+
+    # Use architecture from checkpoint config when available, fall back to CLI args
+    ts_arch = ckpt_cfg.get("ts_arch") or args.ts_arch
+    language_arch = ckpt_cfg.get("language_arch") or args.language_arch
+    decoder_arch = ckpt_cfg.get("decoder_arch") or args.decoder_arch
+    head_arch = ckpt_cfg.get("head_arch") or args.head_arch
+    projection_dim = ckpt_cfg.get("projection_dim") or args.projection_dim
+    decoder_model = ckpt_cfg.get("decoder_model") or args.decoder_model_path
+
+    if decoder_arch != args.decoder_arch:
+        print(f"Note: using decoder_arch='{decoder_arch}' from checkpoint "
+              f"(CLI default was '{args.decoder_arch}')")
 
     model = CoCa(
-        ts_arch=args.ts_arch,
-        language_arch=args.language_arch,
-        decoder_arch=args.decoder_arch,
-        decoder_pretrained_name=args.decoder_model_path,
-        head_arch=args.head_arch,
+        ts_arch=ts_arch,
+        language_arch=language_arch,
+        decoder_arch=decoder_arch,
+        decoder_pretrained_name=decoder_model,
+        head_arch=head_arch,
         ts_pre_train_path=args.ts_model_path,
         patchtst_pretrained_name=args.patchtst_pretrained_name,
         language_pre_train_path=args.language_model_path,
-        projection_dim=args.projection_dim,
+        projection_dim=projection_dim,
+        ts_emb_dim=ckpt_cfg["ts_emb_dim"],
+        lang_emb_dim=ckpt_cfg["lang_emb_dim"],
         caption_loss_weight=args.caption_loss_weight,
         contrastive_loss_weight=args.contrastive_loss_weight,
         classification_loss_weight=args.classification_loss_weight,
-        num_classes=num_classes,
+        num_classes=ckpt_cfg["num_classes"],
         temperature=args.temperature,
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    print(f"Loaded checkpoint: {args.checkpoint_path} (num_classes={num_classes})")
+    print(f"Loaded checkpoint: {args.checkpoint_path} "
+          f"(decoder={decoder_arch}, num_classes={ckpt_cfg['num_classes']})")
 
     return model
 
@@ -136,7 +181,10 @@ def compute_test_loss(model, loader, device):
                 decoder_attention_mask=decoder_attn_mask,
                 return_loss=True,
             )
-            total_loss += loss.item()
+            if hasattr(loss, "loss"):
+                total_loss += loss.loss.item()
+            else:
+                total_loss += loss.item()
     if len(loader) == 0:
         return float("inf")
     return total_loss / len(loader)

@@ -35,6 +35,7 @@ class PTBXL(Dataset):
         label_threshold=0.0,
         label_map=None,
         text_source="report",
+        normalize_mode="per_lead",
     ):
         if sampling_rate not in (100, 500):
             raise ValueError("sampling_rate must be 100 or 500")
@@ -50,6 +51,7 @@ class PTBXL(Dataset):
         self.label_threshold = float(label_threshold)
         self.label_map = label_map
         self.text_source = text_source
+        self.normalize_mode = normalize_mode
         self.use_dual_tokenizer = use_dual_tokenizer
 
         self.encoder_tokenizer = encoder_tokenizer if encoder_tokenizer is not None else tokenizer
@@ -101,8 +103,14 @@ class PTBXL(Dataset):
 
         if self.normalize:
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-            mean = x.mean(dim=1, keepdim=True)
-            std = x.std(dim=1, keepdim=True).clamp(min=1e-6)
+            if self.normalize_mode == "global":
+                # Single mean/std across all leads — preserves inter-lead amplitude ratios.
+                mean = x.mean()
+                std = x.std().clamp(min=1e-6)
+            else:
+                # Per-lead normalization (independent scaling per channel).
+                mean = x.mean(dim=1, keepdim=True)
+                std = x.std(dim=1, keepdim=True).clamp(min=1e-6)
             x = (x - mean) / std
 
         # Truncate or zero-pad AFTER normalization so padding zeros represent the mean

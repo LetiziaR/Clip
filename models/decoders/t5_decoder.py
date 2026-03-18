@@ -3,51 +3,33 @@ import torch.nn as nn
 from transformers import AutoConfig, T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
+from .base_decoder import BaseDecoder
 
-class T5Decoder(nn.Module):
+
+class T5Decoder(BaseDecoder):
 
     def __init__(self, pretrained_name="google/flan-t5-base", ecg_dim=320):
-        super().__init__()
         config = AutoConfig.from_pretrained(pretrained_name)
         config.tie_word_embeddings = False
-        self.model = T5ForConditionalGeneration.from_pretrained(pretrained_name, config=config)
-        # We always bypass T5's encoder by injecting ECG features as pre-computed
-        # encoder_outputs. Delete the encoder to free GPU memory.
-        self.model.encoder = None
-        self.project_ecg = nn.Linear(ecg_dim, self.model.config.d_model)
+        model = T5ForConditionalGeneration.from_pretrained(pretrained_name, config=config)
+        # Bypass T5's encoder — ECG features are injected as encoder_outputs.
+        model.encoder = None
+        super().__init__(ecg_dim=ecg_dim, decoder_hidden_dim=model.config.d_model)
+        self.model = model
 
-    def _project_ecg(self, ecg_tokens):
-        ecg_proj = self.project_ecg(ecg_tokens)
-        ecg_attention_mask = ecg_proj.new_ones(
-            ecg_proj.size(0),
-            ecg_proj.size(1),
-            dtype=torch.long,
-        )
-        return ecg_proj, ecg_attention_mask
-
-    def forward(
-        self,
-        ecg_tokens,
-        input_ids,
-        attention_mask,
-        labels=None,
-    ):
-        ecg_proj, _ = self._project_ecg(ecg_tokens)   # ECG mask is all-ones, not needed
+    def forward(self, ecg_tokens, input_ids, attention_mask, labels=None):
+        ecg_proj, _ = self._project_ecg(ecg_tokens)
 
         model_kwargs = {
             "encoder_outputs": BaseModelOutput(last_hidden_state=ecg_proj),
-            # No encoder attention mask: all ECG tokens are valid (all-ones is T5's default)
             "decoder_attention_mask": attention_mask,
         }
         if labels is not None:
-            # Let T5 auto-create decoder_input_ids via _shift_right(labels).
-            # This ensures decoder_input_ids[i] != labels[i] (proper teacher forcing).
             model_kwargs["labels"] = labels
         else:
             model_kwargs["decoder_input_ids"] = input_ids
 
-        outputs = self.model(**model_kwargs)
-        return outputs
+        return self.model(**model_kwargs)
 
     def generate(
         self,

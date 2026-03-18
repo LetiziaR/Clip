@@ -1,27 +1,21 @@
+import types
 import torch
 import torch.nn as nn
-import types
-from transformers import BioGptConfig
-from transformers import BioGptForCausalLM
+from transformers import BioGptConfig, BioGptForCausalLM
+
+from .base_decoder import BaseDecoder
 
 
-class BioGPTDecoder(nn.Module):
+class BioGPTDecoder(BaseDecoder):
 
     def __init__(self, pretrained_name="microsoft/biogpt", ecg_dim=320):
-        super().__init__()
-
         config = BioGptConfig.from_pretrained(pretrained_name)
         config.add_cross_attention = True
         config.tie_word_embeddings = False
-
-        self.model = BioGptForCausalLM.from_pretrained(
-            pretrained_name,
-            config=config,
-        )
-
+        model = BioGptForCausalLM.from_pretrained(pretrained_name, config=config)
+        super().__init__(ecg_dim=ecg_dim, decoder_hidden_dim=model.config.hidden_size)
+        self.model = model
         self._patch_prepare_inputs_for_generation()
-
-        self.project_ecg = nn.Linear(ecg_dim, self.model.config.hidden_size)
 
     def _patch_prepare_inputs_for_generation(self):
         original_prepare = self.model.prepare_inputs_for_generation
@@ -41,10 +35,7 @@ class BioGPTDecoder(nn.Module):
                 attention_mask=attention_mask,
                 **kwargs,
             )
-            # Explicitly inject ECG features into the returned dict so they are
-            # passed to forward() at every generation step (including steps 2+
-            # when past_key_values is active). Without this, HuggingFace's
-            # generate loop drops them after the first token.
+            # Inject ECG features so they persist across all generation steps.
             if encoder_hidden_states is not None:
                 result["encoder_hidden_states"] = encoder_hidden_states
             if encoder_attention_mask is not None:
@@ -56,32 +47,16 @@ class BioGPTDecoder(nn.Module):
             self.model,
         )
 
-    def _project_ecg(self, ecg_tokens):
-        ecg_proj = self.project_ecg(ecg_tokens)
-        encoder_attention_mask = ecg_proj.new_ones(
-            ecg_proj.size(0),
-            ecg_proj.size(1),
-            dtype=torch.long,
-        )
-        return ecg_proj, encoder_attention_mask
-
-    def forward(
-        self,
-        ecg_tokens,
-        input_ids,
-        attention_mask,
-        labels=None,
-    ):
+    def forward(self, ecg_tokens, input_ids, attention_mask, labels=None):
         ecg_proj, encoder_attention_mask = self._project_ecg(ecg_tokens)
 
-        outputs = self.model(
+        return self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             encoder_hidden_states=ecg_proj,
             encoder_attention_mask=encoder_attention_mask,
             labels=labels,
         )
-        return outputs
 
     def generate(
         self,

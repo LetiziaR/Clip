@@ -1,0 +1,48 @@
+model:
+  ts_arch: ts2vec
+  ts_emb_dim: 320
+  language_arch: bioclinicalbert
+  lang_emb_dim: 768
+  decoder_arch: bart
+  head_arch: mlp
+  projection_dim: 128
+  temperature: 0.07
+  caption_loss_weight: 1.0
+  contrastive_loss_weight: 1.0
+  classification_loss_weight: 0.5
+
+paths:
+  ts_pre_train: ts2vec_pretrained.pt
+  patchtst_pretrained_name: null
+  language_model: emilyalsentzer/Bio_ClinicalBERT
+  decoder_model: null
+  decoder_tokenizer: null
+  checkpoint_dir: checkpoints
+
+data:
+  root: /home/ra59ver/Coca/data
+  sampling_rate: 500
+  text_source: report
+  text_max_length: 128
+  dual_tokenizer: true
+  return_labels: false
+  label_col: scp_codes
+  label_threshold: 0.0
+  normalize_mode: global
+
+training:
+  batch_size: 32
+  epochs: 20
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  seed: 42
+  num_workers: 4
+  lr_scheduler: none
+  early_stopping_patience: 0
+  early_stopping_min_delta: 0.0
+  freeze_language: true
+  unfreeze_language_layers: 2
+  grad_clip_norm: 1.0
+  save_optimizer_state: false
+  skip_test: false
+  run_name: null

@@ -4,7 +4,10 @@ import random
 import numpy as np
 import torch
 
-from evaluation.builders import build_model, build_test_loader, build_tokenizers, compute_test_loss
+from evaluation.builders import (
+    build_model, build_test_loader, build_tokenizers,
+    compute_test_loss, _read_checkpoint_config,
+)
 from evaluation.generation import evaluate_generation
 from evaluation.io_utils import save_generations_jsonl, save_json
 
@@ -24,6 +27,15 @@ def run_evaluation(args):
     set_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Read checkpoint config to auto-detect architecture before building tokenizers
+    checkpoint = torch.load(args.checkpoint_path, map_location="cpu", weights_only=True)
+    ckpt_cfg = _read_checkpoint_config(checkpoint)
+    ckpt_decoder_arch = ckpt_cfg.get("decoder_arch")
+    if ckpt_decoder_arch and ckpt_decoder_arch != args.decoder_arch:
+        print(f"Auto-detected decoder_arch='{ckpt_decoder_arch}' from checkpoint "
+              f"(overriding CLI default '{args.decoder_arch}')")
+        args.decoder_arch = ckpt_decoder_arch
 
     encoder_tokenizer, generation_tokenizer = build_tokenizers(args)
     test_loader = build_test_loader(args, encoder_tokenizer, generation_tokenizer)

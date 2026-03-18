@@ -16,36 +16,37 @@ class CoCaTrainer:
         save_best_only=True,
         scheduler=None,
         freeze_language=True,
+        unfreeze_language_layers=0,
+        grad_clip_norm=1.0,
     ):
-
-        # Store core training components
         self.model = model
-        self.optimizer = optimizer            # Optimizer
+        self.optimizer = optimizer
         self.max_epochs = max_epochs
-        self.pad_token_id = pad_token_id      # Padding token ID for text
-        self.save_dir = save_dir              # Directory to save checkpoints
-        self.save_name = save_name            # Filename for checkpoints
+        self.pad_token_id = pad_token_id
+        self.save_dir = save_dir
+        self.save_name = save_name
         self.save_best_only = save_best_only
         self.best_loss = float("inf")
-        self.scheduler = scheduler            # Optional learning rate scheduler
+        self.scheduler = scheduler
+        self.grad_clip_norm = grad_clip_norm
 
+        model_ref = self._get_model_ref()
 
-
-        # If model is wrapped with DataParallel or DistributedDataParallel,
-        # the real model is inside model.module
-        if hasattr(self.model, "module"):
-            model_ref = self.model.module
-        else:
-            model_ref = self.model
-
-        # Optional: Freeze language encoder
+        # Freeze language encoder, optionally unfreeze top N layers
         if freeze_language:
             lang_enc = model_ref.language_enc
-            lang_enc.eval()
-
-            # Disable gradient updates for language encoder parameters
             for p in lang_enc.parameters():
                 p.requires_grad = False
+
+            if unfreeze_language_layers > 0:
+                encoder_layers = getattr(lang_enc.model, "encoder", None)
+                if encoder_layers is not None:
+                    layers = encoder_layers.layer
+                    for layer in layers[-unfreeze_language_layers:]:
+                        for p in layer.parameters():
+                            p.requires_grad = True
+
+            lang_enc.eval()
 
     def _get_model_ref(self):
         if hasattr(self.model, "module"):
@@ -55,16 +56,16 @@ class CoCaTrainer:
     def _get_device(self):
         return next(self._get_model_ref().parameters()).device
 
-    def _reduce_loss(self, loss_value: float) -> float:
-        """Reduce loss across all ranks in distributed training."""
+    def _reduce_scalar(self, value, count):
+        """Average a scalar across all distributed ranks."""
         if not (dist.is_available() and dist.is_initialized()):
-            return loss_value
+            return value / count if count > 0 else 0.0
 
-        # Convert to tensor, reduce across all ranks, convert back
-        loss_tensor = torch.tensor(loss_value, device=self._get_device())
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        reduced_loss = loss_tensor.item() / dist.get_world_size()
-        return reduced_loss
+        device = self._get_device()
+        stats = torch.tensor([value, float(count)], device=device)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total, n = stats[0].item(), stats[1].item()
+        return total / n if n > 0 else 0.0
 
     def _prepare_batch(self, batch, device):
         if isinstance(batch, dict):
@@ -89,7 +90,6 @@ class CoCaTrainer:
         if decoder_attn_mask is not None:
             decoder_attn_mask = decoder_attn_mask.to(device)
 
-        # SCP classification labels (multi-hot) — only present when return_labels=True
         class_labels = batch.get("labels") if isinstance(batch, dict) else None
         if class_labels is not None:
             class_labels = class_labels.to(device)
@@ -102,9 +102,7 @@ class CoCaTrainer:
 
         return x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, class_labels
 
-
     def train_one_epoch(self, data_loader, epoch):
-
         self.model.train()
         model_ref = self._get_model_ref()
 
@@ -113,102 +111,53 @@ class CoCaTrainer:
 
         device = self._get_device()
 
-        total_loss = 0.0
+        sums = {"loss": 0.0, "caption": 0.0, "contrastive": 0.0, "classification": 0.0}
 
         for batch_idx, batch in enumerate(data_loader):
-            x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, class_labels = self._prepare_batch(batch, device)
+            x_ts, input_ids, attn_mask, labels, dec_ids, dec_mask, class_labels = \
+                self._prepare_batch(batch, device)
 
-            # Zero gradients before forward pass (standard order: zero → forward → backward → step)
             self.optimizer.zero_grad()
 
-            # Forward pass
-            loss = self.model(
-                x_ts,
-                input_ids,
-                attn_mask,
+            output = self.model(
+                x_ts, input_ids, attn_mask,
                 labels=labels,
                 class_labels=class_labels,
-                decoder_input_ids=decoder_input_ids,
-                decoder_attention_mask=decoder_attn_mask,
+                decoder_input_ids=dec_ids,
+                decoder_attention_mask=dec_mask,
                 return_loss=True,
             )
 
-            # Catch NaN/Inf loss before backward — if not caught, backward silently
-            # propagates NaN through all gradients and corrupts every parameter.
-            if torch.isnan(loss) or torch.isinf(loss):
+            if torch.isnan(output.loss) or torch.isinf(output.loss):
                 raise RuntimeError(
-                    f"Loss is {loss.item()} at epoch {epoch}, batch {batch_idx}. "
+                    f"Loss is {output.loss.item()} at epoch {epoch}, batch {batch_idx}. "
                     "Check for NaN in inputs or logit scale explosion."
                 )
 
-            # Backpropagation
-            loss.backward()
-
-            # Gradient clipping — transformer cross-attention layers (BART/T5/BioGPT)
-            # can produce large gradient spikes early in training. Clipping prevents
-            # a single bad batch from corrupting all model weights.
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
+            output.loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip_norm)
             self.optimizer.step()
 
-            # Step the learning rate scheduler if one was provided
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            total_loss += loss.item()
+            sums["loss"] += output.loss.item()
+            sums["caption"] += output.caption_loss.item()
+            sums["contrastive"] += output.contrastive_loss.item()
+            if output.classification_loss is not None:
+                sums["classification"] += output.classification_loss.item()
 
-        if len(data_loader) == 0:
-            return float("inf")
+        n = len(data_loader)
+        if n == 0:
+            return {"loss": float("inf"), "caption_loss": 0, "contrastive_loss": 0,
+                    "classification_loss": 0}
 
-        avg_loss = total_loss / len(data_loader)
-
-        # Reduce loss across all ranks for logging
-        avg_loss = self._reduce_loss(avg_loss)
-
-        # Model Saving 
-        if self.save_dir is not None:
-
-            # In distributed training, only process with rank 0 saves model
-            is_rank_zero = True
-            if dist.is_available() and dist.is_initialized():
-                is_rank_zero = dist.get_rank() == 0
-
-            if is_rank_zero:
-
-                # Create directory if it doesn't exist
-                os.makedirs(self.save_dir, exist_ok=True)
-
-                should_save = True
-
-                # If saving only best model, check improvement
-                if self.save_best_only:
-                    should_save = avg_loss < self.best_loss
-
-                if should_save:
-                    # Update best loss
-                    self.best_loss = min(self.best_loss, avg_loss)
-
-                    # Extract correct state_dict depending on wrapper
-                    if hasattr(self.model, "module"):
-                        state = self.model.module.state_dict()
-                    else:
-                        state = self.model.state_dict()
-
-                    # Define checkpoint path
-                    ckpt_path = os.path.join(self.save_dir, f"{self.save_name}.pt")
-
-                    # Save model + optimizer state for full reproducibility
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "model_state_dict": state,
-                            "optimizer_state_dict": self.optimizer.state_dict(),
-                            "loss": avg_loss,
-                        },
-                        ckpt_path,
-                    )
-
-        return avg_loss
+        return {
+            "loss": self._reduce_scalar(sums["loss"], n),
+            "caption_loss": self._reduce_scalar(sums["caption"], n),
+            "contrastive_loss": self._reduce_scalar(sums["contrastive"], n),
+            "classification_loss": self._reduce_scalar(sums["classification"], n),
+        }
 
     def evaluate(self, data_loader):
         self.model.eval()
@@ -217,29 +166,67 @@ class CoCaTrainer:
             model_ref.language_enc.eval()
 
         device = self._get_device()
-        total_loss = 0.0
+        sums = {"loss": 0.0, "caption": 0.0, "contrastive": 0.0, "classification": 0.0}
+        all_ts_proj = []
+        all_text_proj = []
 
         with torch.no_grad():
             for batch in data_loader:
-                x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, class_labels = self._prepare_batch(batch, device)
-                loss = self.model(
-                    x_ts,
-                    input_ids,
-                    attn_mask,
+                x_ts, input_ids, attn_mask, labels, dec_ids, dec_mask, class_labels = \
+                    self._prepare_batch(batch, device)
+
+                output = self.model(
+                    x_ts, input_ids, attn_mask,
                     labels=labels,
                     class_labels=class_labels,
-                    decoder_input_ids=decoder_input_ids,
-                    decoder_attention_mask=decoder_attn_mask,
+                    decoder_input_ids=dec_ids,
+                    decoder_attention_mask=dec_mask,
                     return_loss=True,
                 )
-                total_loss += loss.item()
 
-        if len(data_loader) == 0:
-            return float("inf")
+                sums["loss"] += output.loss.item()
+                sums["caption"] += output.caption_loss.item()
+                sums["contrastive"] += output.contrastive_loss.item()
+                if output.classification_loss is not None:
+                    sums["classification"] += output.classification_loss.item()
 
-        avg_loss = total_loss / len(data_loader)
+                all_ts_proj.append(output.ts_proj)
+                all_text_proj.append(output.text_proj)
 
-        # Reduce loss across all ranks for logging
-        avg_loss = self._reduce_loss(avg_loss)
+        n = len(data_loader)
+        if n == 0:
+            return {"loss": float("inf")}
 
-        return avg_loss
+        metrics = {
+            "loss": self._reduce_scalar(sums["loss"], n),
+            "caption_loss": self._reduce_scalar(sums["caption"], n),
+            "contrastive_loss": self._reduce_scalar(sums["contrastive"], n),
+            "classification_loss": self._reduce_scalar(sums["classification"], n),
+        }
+
+        # Contrastive retrieval R@K
+        all_ts_proj = torch.cat(all_ts_proj, dim=0)
+        all_text_proj = torch.cat(all_text_proj, dim=0)
+        metrics.update(self._retrieval_at_k(all_ts_proj, all_text_proj))
+
+        return metrics
+
+    @staticmethod
+    def _retrieval_at_k(ts_proj, text_proj, ks=(1, 5, 10)):
+        """Compute ECG→Text and Text→ECG recall@K."""
+        sim = torch.mm(ts_proj, text_proj.T)  # (N, N)
+        n = sim.size(0)
+        targets = torch.arange(n, device=sim.device)
+
+        metrics = {}
+        for k in ks:
+            if k > n:
+                continue
+            _, topk = sim.topk(k, dim=1)
+            ecg2text = (topk == targets.unsqueeze(1)).any(dim=1).float().mean().item()
+            _, topk = sim.T.topk(k, dim=1)
+            text2ecg = (topk == targets.unsqueeze(1)).any(dim=1).float().mean().item()
+            metrics[f"ecg2text_R@{k}"] = ecg2text
+            metrics[f"text2ecg_R@{k}"] = text2ecg
+
+        return metrics

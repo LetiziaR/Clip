@@ -22,13 +22,10 @@ echo "[INFO] python=$(python --version 2>&1)"
 echo "[INFO] date=$(date -Iseconds)"
 nvidia-smi || true
 
-torchrun --nproc_per_node=gpu python -X faulthandler -u run_coca.py \
-  --run_name coca_best_lr1e4_bs32_temp007_pseudo_to_report \
-  --learning_rate 1e-4 \
-  --batch_size 32 \
-  --temperature 0.07 \
-  --epochs 20 \
-  --ts_arch ts2vec \
-  --decoder_arch bart \
-  --text_source pseudo_report \
+# Use --config for all parameters, --override for per-run changes.
+torchrun --nproc_per_node=gpu run_coca.py \
+  --config configs/default.yaml \
+  --override \
+    training.run_name=coca_best_lr1e4_bs32_temp007_pseudo_to_report \
+    data.text_source=pseudo_report \
   "$@" 2>&1 | tee "logs/train_best_${SLURM_JOB_ID:-manual}.log"

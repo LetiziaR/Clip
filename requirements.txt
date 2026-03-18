@@ -18,6 +18,9 @@ numpy>=1.24.0
 # Plotting (loss curves)
 matplotlib>=3.7.0
 
+# Configuration
+pyyaml>=6.0
+
 # ─── Evaluation dependencies ──────────────────────────────────────────────────
 
 # BERTScore (--compute_bertscore, default: enabled during evaluation)
