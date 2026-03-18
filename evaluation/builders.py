@@ -22,14 +22,10 @@ def build_tokenizers(args):
         if decoder_tok_path is None:
             if args.decoder_arch == "bart":
                 decoder_tok_path = "facebook/bart-base"
-            elif args.decoder_arch == "mbart":
-                decoder_tok_path = "facebook/mbart-large-50-many-to-many-mmt"
             elif args.decoder_arch == "gpt2":
                 decoder_tok_path = "gpt2"
             elif args.decoder_arch == "biogpt":
                 decoder_tok_path = "microsoft/biogpt"
-            elif args.decoder_arch == "mt5":
-                decoder_tok_path = "google/mt5-base"
             else:
                 decoder_tok_path = "google/flan-t5-base"
 
@@ -70,12 +66,13 @@ def build_test_loader(args, encoder_tokenizer, generation_tokenizer):
     )
 
 
-def build_model(args, device):
+def build_model(args, device, label_names=None):
     model = CoCa(
         ts_arch=args.ts_arch,
         language_arch=args.language_arch,
         decoder_arch=args.decoder_arch,
         decoder_pretrained_name=args.decoder_model_path,
+        decoder_max_ecg_tokens=args.decoder_max_ecg_tokens,
         head_arch=args.head_arch,
         ts_pre_train_path=args.ts_model_path,
         patchtst_pretrained_name=args.patchtst_pretrained_name,
@@ -83,6 +80,9 @@ def build_model(args, device):
         projection_dim=args.projection_dim,
         caption_loss_weight=args.caption_loss_weight,
         contrastive_loss_weight=args.contrastive_loss_weight,
+        aux_classification_loss_weight=args.aux_classification_loss_weight,
+        enable_grouped_aux_heads=args.enable_grouped_aux_heads,
+        label_names=label_names,
         temperature=args.temperature,
     ).to(device)
 

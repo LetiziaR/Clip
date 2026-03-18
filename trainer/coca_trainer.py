@@ -64,12 +64,14 @@ class CoCaTrainer:
             attn_mask = batch["attention_mask"]
             decoder_input_ids = batch.get("decoder_input_ids")
             decoder_attn_mask = batch.get("decoder_attention_mask")
+            clinical_labels = batch.get("labels")
         else:
             if len(batch) < 3:
                 raise ValueError("Batch must contain at least (x_ts, input_ids, attention_mask)")
             x_ts, input_ids, attn_mask = batch[:3]
             decoder_input_ids = None
             decoder_attn_mask = None
+            clinical_labels = None
 
         x_ts = x_ts.to(device)
         input_ids = input_ids.to(device)
@@ -79,6 +81,8 @@ class CoCaTrainer:
             decoder_input_ids = decoder_input_ids.to(device)
         if decoder_attn_mask is not None:
             decoder_attn_mask = decoder_attn_mask.to(device)
+        if clinical_labels is not None:
+            clinical_labels = clinical_labels.to(device)
 
         caption_ids = decoder_input_ids if decoder_input_ids is not None else input_ids
         caption_mask = decoder_attn_mask if decoder_attn_mask is not None else attn_mask
@@ -86,7 +90,7 @@ class CoCaTrainer:
         labels = caption_ids.clone()
         labels = labels.masked_fill(caption_mask == 0, -100)
 
-        return x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask
+        return x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, clinical_labels
 
 
     def train_one_epoch(self, data_loader, epoch):
@@ -102,7 +106,7 @@ class CoCaTrainer:
         total_loss = 0.0
 
         for batch in data_loader:
-            x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask = self._prepare_batch(batch, device)
+            x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, clinical_labels = self._prepare_batch(batch, device)
 
             # Forward pass
             loss = self.model(
@@ -110,6 +114,7 @@ class CoCaTrainer:
                 input_ids,
                 attn_mask,
                 labels=labels,
+                clinical_labels=clinical_labels,
                 decoder_input_ids=decoder_input_ids,
                 decoder_attention_mask=decoder_attn_mask,
                 return_loss=True,
@@ -179,12 +184,13 @@ class CoCaTrainer:
 
         with torch.no_grad():
             for batch in data_loader:
-                x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask = self._prepare_batch(batch, device)
+                x_ts, input_ids, attn_mask, labels, decoder_input_ids, decoder_attn_mask, clinical_labels = self._prepare_batch(batch, device)
                 loss = self.model(
                     x_ts,
                     input_ids,
                     attn_mask,
                     labels=labels,
+                    clinical_labels=clinical_labels,
                     decoder_input_ids=decoder_input_ids,
                     decoder_attention_mask=decoder_attn_mask,
                     return_loss=True,

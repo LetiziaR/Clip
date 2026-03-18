@@ -1,4 +1,12 @@
 import argparse
+import sys
+
+
+def _flag_was_provided(flag):
+    for token in sys.argv[1:]:
+        if token == flag or token.startswith(f"{flag}="):
+            return True
+    return False
 
 
 def parse_args():
@@ -14,11 +22,26 @@ def parse_args():
     parser.add_argument("--patchtst_pretrained_name", type=str, default=None)
     parser.add_argument("--ts_arch", type=str, default="ts2vec", choices=["ts2vec", "patchtst"])
     parser.add_argument("--language_arch", type=str, default="bioclinicalbert")
-    parser.add_argument("--decoder_arch", type=str, default="bart", choices=["bart", "mbart", "gpt2", "t5", "mt5", "biogpt"])
+    parser.add_argument(
+        "--decoder_arch",
+        type=str,
+        default="bart",
+        choices=["bart", "gpt2", "t5", "flant5", "flan_t5", "flan-t5", "biogpt"],
+    )
+    parser.add_argument(
+        "--decoder_max_ecg_tokens",
+        type=int,
+        default=512,
+        help="Maximum ECG tokens passed to decoder cross-attention. <=0 disables downsampling.",
+    )
     parser.add_argument("--head_arch", type=str, default="mlp")
     parser.add_argument("--projection_dim", type=int, default=128)
     parser.add_argument("--caption_loss_weight", type=float, default=1.0)
     parser.add_argument("--contrastive_loss_weight", type=float, default=1.0)
+    parser.add_argument("--aux_classification_loss_weight", type=float, default=0.0)
+    parser.add_argument("--enable_grouped_aux_heads", action="store_true")
+    parser.add_argument("--disable_grouped_aux_heads", dest="enable_grouped_aux_heads", action="store_false")
+    parser.set_defaults(enable_grouped_aux_heads=False)
     parser.add_argument("--temperature", type=float, default=0.07)
 
     parser.add_argument("--batch_size", type=int, default=64)
@@ -42,6 +65,9 @@ def parse_args():
     parser.set_defaults(gen_do_sample=False)
     parser.add_argument("--gen_temperature", type=float, default=0.8)
     parser.add_argument("--gen_top_p", type=float, default=0.95)
+    parser.add_argument("--gen_no_repeat_ngram_size", type=int, default=3)
+    parser.add_argument("--gen_repetition_penalty", type=float, default=1.15)
+    parser.add_argument("--gen_length_penalty", type=float, default=1.0)
     parser.add_argument("--gen_max_batches", type=int, default=0)
 
     parser.add_argument("--compute_bertscore", dest="compute_bertscore", action="store_true")
@@ -51,9 +77,26 @@ def parse_args():
     parser.add_argument("--no_full_metrics", dest="full_metrics", action="store_false")
     parser.set_defaults(full_metrics=False)
     parser.add_argument("--bertscore_model_type", type=str, default="xlm-roberta-large")
+    parser.add_argument(
+        "--bertscore_model_alias",
+        type=str,
+        default=None,
+        choices=["general_roberta", "general_xlm", "clinicalbert", "biobert", "pubmedbert"],
+    )
     parser.add_argument("--bertscore_batch_size", type=int, default=16)
     parser.add_argument("--bertscore_lang", type=str, default="en")
     parser.add_argument("--bertscore_rescale_with_baseline", action="store_true")
     parser.add_argument("--no_bertscore_rescale_with_baseline", dest="bertscore_rescale_with_baseline", action="store_false")
     parser.set_defaults(bertscore_rescale_with_baseline=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Keep defaults aggressive for SR100, but safer for SR500 unless user overrides.
+    if args.sampling_rate == 500:
+        if not _flag_was_provided("--batch_size"):
+            args.batch_size = 8
+        if not _flag_was_provided("--gen_num_beams"):
+            args.gen_num_beams = 1
+        if not _flag_was_provided("--gen_max_new_tokens"):
+            args.gen_max_new_tokens = 64
+
+    return args

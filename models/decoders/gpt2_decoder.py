@@ -78,6 +78,9 @@ class GPT2Decoder(nn.Module):
         do_sample=False,
         temperature=1.0,
         top_p=1.0,
+        no_repeat_ngram_size=0,
+        repetition_penalty=1.0,
+        length_penalty=1.0,
         bos_token_id=None,
         pad_token_id=None,
         eos_token_id=None,
@@ -112,6 +115,9 @@ class GPT2Decoder(nn.Module):
             "num_beams": num_beams,
             "do_sample": do_sample,
             "eos_token_id": eos_token_id,
+            "no_repeat_ngram_size": no_repeat_ngram_size,
+            "repetition_penalty": repetition_penalty,
+            "length_penalty": length_penalty,
         }
         # For GPT-2 we often set pad_token_id = eos_token_id.
         # Passing that as pad id can trigger right-padding warnings in generation

@@ -17,6 +17,38 @@ _CLINICAL_CONCEPT_PATTERNS = {
     "myocardial_infarction": [r"\bmyocardial infarction\b", r"\binfarkt\b", r"\bmyokardschaden\b"],
     "ischemia": [r"\bischemi\w*\b", r"\bischaemi\w*\b", r"\bst depression\b", r"\bst elevation\b"],
     "lvh": [r"\bleft ventricular hypertrophy\b", r"\blvh\b", r"\blinksbelastung\b"],
+    "left_axis_deviation": [r"\bleft axis deviation\b", r"\blinkstyp\b", r"\bueberdrehter linkstyp\b"],
+    "right_axis_deviation": [r"\bright axis deviation\b", r"\brechtstyp\b"],
+    "ventricular_extrasystole": [
+        r"\bventricular extrasystol\w*\b",
+        r"\bventrikul[aä]re extrasystol\w*\b",
+        r"\bpvc\w*\b",
+        r"\bpremature ventricular complex\w*\b",
+        r"\bpremature ventricular beat\w*\b",
+    ],
+    "supraventricular_extrasystole": [
+        r"\bsupraventricular extrasystol\w*\b",
+        r"\bsupraventrikul[aä]re extrasystol\w*\b",
+        r"\bpac\w*\b",
+    ],
+    "sinus_arrhythmia": [r"\bsinus arrhythmia\b", r"\bsinusarrhythm\w*\b", r"\bsinus arrhythmie\b"],
+    "junctional_rhythm": [r"\bjunctional rhythm\b", r"\bjunctional\b", r"\bknot\w*rhythm\w*\b"],
+    "wpw_pattern": [r"\bwpw\b", r"\bwolff[ -]?parkinson[ -]?white\b"],
+    "qt_prolongation": [r"\bqt\s*[- ]?verl[aä]nger\w*\b", r"\blong qt\b", r"\bqt\s*prolong\w*\b"],
+    "t_wave_inversion": [r"\bt[ -]?wave inversion\b", r"\bt wave inversion\b", r"\bt[ -]?inversion\b"],
+    "st_elevation": [r"\bst\s*[- ]?elevat\w*\b", r"\bstemi\b", r"\bst\s*[- ]?hebung\b"],
+    "st_depression": [r"\bst\s*[- ]?depress\w*\b", r"\bst\s*[- ]?senkung\b"],
+    "low_voltage": [r"\blow voltage\b", r"\bniedervoltage\b"],
+    "pacemaker_rhythm": [r"\bpacemaker\b", r"\bpaced rhythm\b", r"\bschrittmacher\b"],
+}
+
+
+_BERTSCORE_MODEL_ALIASES = {
+    "general_roberta": "roberta-large",
+    "general_xlm": "xlm-roberta-large",
+    "clinicalbert": "emilyalsentzer/Bio_ClinicalBERT",
+    "biobert": "dmis-lab/biobert-base-cased-v1.1",
+    "pubmedbert": "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
 }
 
 
@@ -45,11 +77,18 @@ def _compute_bertscore(
     predictions,
     references,
     model_type="roberta-large",
+    model_alias=None,
     batch_size=16,
     lang="en",
     rescale_with_baseline=True,
 ):
     from bert_score import score as bertscore_score
+
+    if model_alias:
+        if model_alias not in _BERTSCORE_MODEL_ALIASES:
+            valid = ", ".join(sorted(_BERTSCORE_MODEL_ALIASES))
+            raise ValueError(f"Unknown BERTScore model alias '{model_alias}'. Valid aliases: {valid}")
+        model_type = _BERTSCORE_MODEL_ALIASES[model_alias]
 
     precision, recall, f1 = bertscore_score(
         predictions,
@@ -64,6 +103,8 @@ def _compute_bertscore(
         "bertscore_precision": float(precision.mean().item()),
         "bertscore_recall": float(recall.mean().item()),
         "bertscore_f1": float(f1.mean().item()),
+        "bertscore_model_type": model_type,
+        "bertscore_model_alias": model_alias,
     }
 
 
@@ -184,6 +225,7 @@ def compute_text_generation_metrics(
     full_metrics=False,
     compute_bertscore=False,
     bertscore_model_type="roberta-large",
+    bertscore_model_alias=None,
     bertscore_batch_size=16,
     bertscore_lang="en",
     bertscore_rescale_with_baseline=True,
@@ -210,6 +252,12 @@ def compute_text_generation_metrics(
             metrics["bertscore_precision"] = 0.0
             metrics["bertscore_recall"] = 0.0
             metrics["bertscore_f1"] = 0.0
+            resolved_alias = bertscore_model_alias
+            resolved_type = bertscore_model_type
+            if resolved_alias:
+                resolved_type = _BERTSCORE_MODEL_ALIASES.get(resolved_alias, resolved_type)
+            metrics["bertscore_model_type"] = resolved_type
+            metrics["bertscore_model_alias"] = resolved_alias
         return metrics
 
     exact_match = 0
@@ -265,6 +313,7 @@ def compute_text_generation_metrics(
                     predictions,
                     references,
                     model_type=bertscore_model_type,
+                    model_alias=bertscore_model_alias,
                     batch_size=bertscore_batch_size,
                     lang=bertscore_lang,
                     rescale_with_baseline=bertscore_rescale_with_baseline,

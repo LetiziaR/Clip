@@ -28,7 +28,18 @@ def parse_args():
     parser.add_argument("--patchtst_pretrained_name", type=str, default=None)
     parser.add_argument("--ts_arch", type=str, default="ts2vec", choices=["ts2vec", "patchtst"])
     parser.add_argument("--language_arch", type=str, default="bioclinicalbert")
-    parser.add_argument("--decoder_arch", type=str, default="bart", choices=["bart", "mbart", "gpt2", "t5", "mt5", "biogpt"])
+    parser.add_argument(
+        "--decoder_arch",
+        type=str,
+        default="bart",
+        choices=["bart", "gpt2", "t5", "flant5", "flan_t5", "flan-t5", "biogpt"],
+    )
+    parser.add_argument(
+        "--decoder_max_ecg_tokens",
+        type=int,
+        default=512,
+        help="Maximum ECG tokens passed to decoder cross-attention. <=0 disables downsampling.",
+    )
     parser.add_argument("--head_arch", type=str, default="mlp")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
@@ -36,6 +47,10 @@ def parse_args():
     parser.add_argument("--projection_dim", type=int, default=128)
     parser.add_argument("--caption_loss_weight", type=float, default=1.0)
     parser.add_argument("--contrastive_loss_weight", type=float, default=1.0)
+    parser.add_argument("--aux_classification_loss_weight", type=float, default=0.0)
+    parser.add_argument("--enable_grouped_aux_heads", action="store_true")
+    parser.add_argument("--disable_grouped_aux_heads", dest="enable_grouped_aux_heads", action="store_false")
+    parser.set_defaults(enable_grouped_aux_heads=False)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--sampling_rate", type=int, default=500, choices=[100, 500])
@@ -113,6 +128,9 @@ def safe_save_checkpoint(payload, path, allow_model_only_fallback=True):
 
 def main():
     args = parse_args()
+    if args.enable_grouped_aux_heads and not args.return_labels:
+        print("[INFO] Enabling --return_labels because grouped auxiliary heads require clinical labels.")
+        args.return_labels = True
     set_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -136,14 +154,10 @@ def main():
         if decoder_tok_path is None:
             if args.decoder_arch == "bart":
                 decoder_tok_path = "facebook/bart-base"
-            elif args.decoder_arch == "mbart":
-                decoder_tok_path = "facebook/mbart-large-50-many-to-many-mmt"
             elif args.decoder_arch == "gpt2":
                 decoder_tok_path = "gpt2"
             elif args.decoder_arch == "biogpt":
                 decoder_tok_path = "microsoft/biogpt"
-            elif args.decoder_arch == "mt5":
-                decoder_tok_path = "google/mt5-base"
             else:
                 decoder_tok_path = "google/flan-t5-base"
         decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_tok_path)
@@ -228,11 +242,16 @@ def main():
     print(f"Val samples: {len(val_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
 
+    label_names = None
+    if shared_label_map is not None:
+        label_names = [name for name, _ in sorted(shared_label_map.items(), key=lambda kv: kv[1])]
+
     model = CoCa(
         ts_arch=args.ts_arch,
         language_arch=args.language_arch,
         decoder_arch=args.decoder_arch,
         decoder_pretrained_name=args.decoder_model_path,
+        decoder_max_ecg_tokens=args.decoder_max_ecg_tokens,
         head_arch=args.head_arch,
         ts_pre_train_path=args.ts_model_path,
         patchtst_pretrained_name=args.patchtst_pretrained_name,
@@ -240,6 +259,9 @@ def main():
         projection_dim=args.projection_dim,
         caption_loss_weight=args.caption_loss_weight,
         contrastive_loss_weight=args.contrastive_loss_weight,
+        aux_classification_loss_weight=args.aux_classification_loss_weight,
+        enable_grouped_aux_heads=args.enable_grouped_aux_heads,
+        label_names=label_names,
         temperature=args.temperature,
     ).to(device)
 

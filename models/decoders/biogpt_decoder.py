@@ -96,6 +96,9 @@ class BioGPTDecoder(nn.Module):
         do_sample=False,
         temperature=1.0,
         top_p=1.0,
+        no_repeat_ngram_size=0,
+        repetition_penalty=1.0,
+        length_penalty=1.0,
         bos_token_id=None,
         pad_token_id=None,
         eos_token_id=None,
@@ -130,6 +133,9 @@ class BioGPTDecoder(nn.Module):
             "num_beams": num_beams,
             "do_sample": do_sample,
             "eos_token_id": eos_token_id,
+            "no_repeat_ngram_size": no_repeat_ngram_size,
+            "repetition_penalty": repetition_penalty,
+            "length_penalty": length_penalty,
         }
         if pad_token_id is not None and pad_token_id != start_token_id:
             generate_kwargs["pad_token_id"] = pad_token_id

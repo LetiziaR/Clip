@@ -1,21 +1,7 @@
 __pycache__/
 *.pyc
 
-# Training/evaluation artifacts
-checkpoints/
-logs/
-slurm-*.out
-*.log
-
-# Model and data artifacts
-*.pt
-*.pth
-
-# Notebook and cache artifacts
-.ipynb_checkpoints/
-
-# Environment and editor files
-.env
-.venv/
-venv/
-.DS_Store
+/checkpoints/
+/logs/
+/train_eval_decoder.slurm
+/ts2vec_pretrained.pt

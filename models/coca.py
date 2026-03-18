@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from .encoders.get_ts_model import get_ts_model
 from .encoders.get_language_model import get_language_model
 from .decoders.get_decoder import get_decoder
-from .heads import get_head
+from .heads import GroupedAuxiliaryHeads, build_ptbxl_grouped_label_indices, get_head
 from losses.contrastive_loss import ContrastiveLoss
 
 
@@ -18,6 +18,7 @@ class CoCa(nn.Module):
         language_arch: str,
         decoder_arch: str,
         decoder_pretrained_name: Optional[str],
+        decoder_max_ecg_tokens: Optional[int],
         head_arch: str,
         ts_pre_train_path: Optional[str],
         patchtst_pretrained_name: Optional[str],
@@ -25,6 +26,9 @@ class CoCa(nn.Module):
         projection_dim: int,
         caption_loss_weight: float = 1.0,
         contrastive_loss_weight: float = 1.0,
+        aux_classification_loss_weight: float = 0.0,
+        enable_grouped_aux_heads: bool = False,
+        label_names: Optional[list[str]] = None,
         temperature: float = 0.07,
     ):
         super().__init__()
@@ -32,6 +36,7 @@ class CoCa(nn.Module):
         self.projection_dim = projection_dim
         self.caption_loss_weight = caption_loss_weight
         self.contrastive_loss_weight = contrastive_loss_weight
+        self.aux_classification_loss_weight = aux_classification_loss_weight
 
         # Embedding dimensions 
 
@@ -62,6 +67,7 @@ class CoCa(nn.Module):
             arch=decoder_arch,
             ts_embedding_dim=self.ts_emb_dim,
             pretrained_name=decoder_pretrained_name,
+            max_ecg_tokens=decoder_max_ecg_tokens,
         )
 
         # Projection heads (contrastive)
@@ -85,6 +91,16 @@ class CoCa(nn.Module):
             torch.tensor(1 / temperature).log()
         )
 
+        self.grouped_aux_heads = None
+        if enable_grouped_aux_heads:
+            if not label_names:
+                raise ValueError("label_names must be provided when enable_grouped_aux_heads=True")
+            grouped_indices = build_ptbxl_grouped_label_indices(label_names)
+            self.grouped_aux_heads = GroupedAuxiliaryHeads(
+                embedding_dim=self.ts_emb_dim,
+                group_to_indices=grouped_indices,
+            )
+
     # Forward
     def forward(
         self,
@@ -92,6 +108,7 @@ class CoCa(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        clinical_labels: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
         return_loss: bool = False,
@@ -148,9 +165,14 @@ class CoCa(nn.Module):
             logit_scale=self.log_temperature.exp(),
         )
 
+        aux_loss = ts_proj.new_zeros(())
+        if self.grouped_aux_heads is not None and clinical_labels is not None:
+            aux_loss, _ = self.grouped_aux_heads.compute_loss(ts_global, clinical_labels)
+
         total_loss = (
             self.caption_loss_weight * caption_loss +
-            self.contrastive_loss_weight * contrastive_loss
+            self.contrastive_loss_weight * contrastive_loss +
+            self.aux_classification_loss_weight * aux_loss
         )
 
         return total_loss

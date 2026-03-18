@@ -13,10 +13,14 @@ def evaluate_generation(
     do_sample,
     temperature,
     top_p,
+    no_repeat_ngram_size,
+    repetition_penalty,
+    length_penalty,
     max_batches,
     full_metrics,
     compute_bertscore,
     bertscore_model_type,
+    bertscore_model_alias,
     bertscore_batch_size,
     bertscore_lang,
     bertscore_rescale_with_baseline,
@@ -24,6 +28,11 @@ def evaluate_generation(
     model_ref = model.module if hasattr(model, "module") else model
     model_ref.eval()
     device = next(model_ref.parameters()).device
+    decoder_model = getattr(getattr(model_ref, "decoder", None), "model", None)
+
+    if decoder_model is not None:
+        cfg = getattr(decoder_model, "config", None)
+        model_type = getattr(cfg, "model_type", "") if cfg is not None else ""
 
     predictions = []
     references = []
@@ -47,6 +56,13 @@ def evaluate_generation(
             bos_token_id = getattr(generation_tokenizer, "bos_token_id", None)
             eos_token_id = getattr(generation_tokenizer, "eos_token_id", None)
             pad_token_id = getattr(generation_tokenizer, "pad_token_id", None)
+
+            # For seq2seq decoders, prefer model defaults instead of forcing generic tokenizer BOS.
+            if decoder_model is not None:
+                cfg = getattr(decoder_model, "config", None)
+                if cfg is not None and getattr(cfg, "is_encoder_decoder", False):
+                    bos_token_id = None
+
             if bos_token_id is None:
                 bos_token_id = getattr(generation_tokenizer, "cls_token_id", None)
             if eos_token_id is None:
@@ -59,6 +75,9 @@ def evaluate_generation(
                 do_sample=do_sample,
                 temperature=temperature,
                 top_p=top_p,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                repetition_penalty=repetition_penalty,
+                length_penalty=length_penalty,
                 bos_token_id=bos_token_id,
                 eos_token_id=eos_token_id,
                 pad_token_id=pad_token_id,
@@ -67,9 +86,18 @@ def evaluate_generation(
             ref_ids = ref_ids.detach().cpu() if hasattr(ref_ids, "detach") else ref_ids
 
             pred_texts = generation_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            raw_pred_texts = generation_tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
             ref_texts = reference_tokenizer.batch_decode(ref_ids, skip_special_tokens=True)
 
-            predictions.extend([t.strip() for t in pred_texts])
+            normalized_preds = []
+            for pred_text, raw_text in zip(pred_texts, raw_pred_texts):
+                pred_norm = pred_text.strip()
+                if not pred_norm:
+                    fallback = raw_text.replace("<pad>", "").replace("</s>", "").replace("<s>", "").strip()
+                    pred_norm = fallback
+                normalized_preds.append(pred_norm)
+
+            predictions.extend(normalized_preds)
             references.extend([t.strip() for t in ref_texts])
 
     metrics = compute_text_generation_metrics(
@@ -78,6 +106,7 @@ def evaluate_generation(
         full_metrics=full_metrics,
         compute_bertscore=compute_bertscore,
         bertscore_model_type=bertscore_model_type,
+        bertscore_model_alias=bertscore_model_alias,
         bertscore_batch_size=bertscore_batch_size,
         bertscore_lang=bertscore_lang,
         bertscore_rescale_with_baseline=bertscore_rescale_with_baseline,
