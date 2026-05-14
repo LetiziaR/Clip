@@ -1,7 +1,47 @@
 __pycache__/
 *.pyc
+#data
+data/records100
+data/records500
+data/example_physionet.py   
+data/LICENSE.txt
+data/RECORDS
+data/ptbxl_database.csv
+data/ptbxl_v102_changelog.txt
+data/ptbxl_v103_changelog.txt
+data/robots.txt
+data/scp_statements.csv
+data/SHA256SUMS.txt
 
-/checkpoints/
-/logs/
-/train_eval_decoder.slurm
-/ts2vec_pretrained.pt
+
+ts2vec.py
+ts2vec/
+ts2vec_models/
+ts2vec_utils.py
+
+# Training/evaluation artifacts
+checkpoints/
+checkpoints
+eval_results/
+logs/
+slurm/
+slurm-*.out
+*.log
+
+# Model and data artifacts
+
+*.pth
+*.pt
+
+# Presentation/binary outputs
+slides/
+presentation_figures/
+
+# Notebook and cache artifacts
+.ipynb_checkpoints/
+
+# Environment and editor files
+.env
+.venv/
+venv/
+.DS_Store

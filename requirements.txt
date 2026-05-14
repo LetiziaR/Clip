@@ -1,0 +1,47 @@
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Hugging Face ecosystem
+transformers>=4.35.0   # PatchTST support added in 4.35
+tokenizers>=0.14.0
+sacremoses>=0.0.53     # Required for BioGPT tokenizer
+protobuf>=3.20.0       # Required for BioGPT tokenizer
+
+# ECG signal reading (PhysioNet WFDB format)
+wfdb>=4.1.0
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Plotting (loss curves)
+matplotlib>=3.7.0
+
+# Configuration
+pyyaml>=6.0
+
+# ─── Evaluation dependencies ──────────────────────────────────────────────────
+
+# TorchMetrics: unified API for BLEU-4, ROUGE-L, BERTScore
+torchmetrics>=1.0.0
+
+# Backends required by TorchMetrics text metrics
+sacrebleu>=2.4.0     # SacreBLEUScore tokenization spec
+rouge-score>=0.1.2   # ROUGEScore backend
+
+# CIDEr-D (MS-COCO caption eval reference implementation, not in TorchMetrics)
+pycocoevalcap>=1.2
+
+# METEOR metric (--full_metrics, not in TorchMetrics)
+nltk>=3.8.1
+
+# ─── TS2Vec (time-series encoder) ─────────────────────────────────────────────
+# TS2Vec is NOT on PyPI. Clone and install manually:
+#
+#   git clone https://github.com/yuezhihan/ts2vec.git
+#   pip install -e ts2vec/
+#
+# The package must be importable as `ts2vec` (i.e., on PYTHONPATH or installed).
+# Required version: any recent commit that exposes TS2Vec(input_dims, output_dims,
+# hidden_dims, depth) with .fit() and .load() methods.

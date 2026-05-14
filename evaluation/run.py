@@ -5,7 +5,10 @@ import json
 import numpy as np
 import torch
 
-from evaluation.builders import build_model, build_test_loader, build_tokenizers, build_trainer
+from evaluation.builders import (
+    build_model, build_test_loader, build_tokenizers,
+    compute_test_loss, _read_checkpoint_config,
+)
 from evaluation.generation import evaluate_generation
 from evaluation.io_utils import save_generations_jsonl, save_json
 
@@ -79,27 +82,30 @@ def run_evaluation(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    encoder_tokenizer, generation_tokenizer, reference_tokenizer = build_tokenizers(args)
-    test_loader = build_test_loader(args, encoder_tokenizer, generation_tokenizer)
+    # Read checkpoint config to auto-detect architecture before building tokenizers
+    checkpoint = torch.load(args.checkpoint_path, map_location="cpu", weights_only=True)
+    ckpt_cfg = _read_checkpoint_config(checkpoint)
+    ckpt_decoder_arch = ckpt_cfg.get("decoder_arch")
+    if ckpt_decoder_arch and ckpt_decoder_arch != args.decoder_arch:
+        print(f"Auto-detected decoder_arch='{ckpt_decoder_arch}' from checkpoint "
+              f"(overriding CLI default '{args.decoder_arch}')")
+        args.decoder_arch = ckpt_decoder_arch
 
-    label_names = None
-    label_map = getattr(getattr(test_loader, "dataset", None), "label_map", None)
-    if label_map is not None:
-        label_names = [name for name, _ in sorted(label_map.items(), key=lambda kv: kv[1])]
+    encoder_tokenizer, generation_tokenizer = build_tokenizers(args)
+    test_loader = build_test_loader(args, encoder_tokenizer, generation_tokenizer, ckpt_cfg=ckpt_cfg)
 
-    model = build_model(args, device, label_names=label_names)
-    trainer = build_trainer(args, model, generation_tokenizer, encoder_tokenizer)
+    model = build_model(args, device)
 
     test_loss = None
     if not args.skip_test_loss:
-        test_loss = trainer.evaluate(test_loader)
+        test_loss = compute_test_loss(model, test_loader, device)
         print(f"Test loss: {test_loss:.4f}")
 
     generation_metrics, predictions, references = evaluate_generation(
         model=model,
         data_loader=test_loader,
         generation_tokenizer=generation_tokenizer,
-        reference_tokenizer=reference_tokenizer,
+        reference_tokenizer=generation_tokenizer,
         max_new_tokens=args.gen_max_new_tokens,
         num_beams=args.gen_num_beams,
         do_sample=args.gen_do_sample,
@@ -111,6 +117,7 @@ def run_evaluation(args):
         max_batches=args.gen_max_batches,
         full_metrics=args.full_metrics,
         compute_bertscore=args.compute_bertscore,
+        compute_clinical_concepts=getattr(args, "compute_clinical_concepts", False),
         bertscore_model_type=args.bertscore_model_type,
         bertscore_model_alias=args.bertscore_model_alias,
         bertscore_batch_size=args.bertscore_batch_size,

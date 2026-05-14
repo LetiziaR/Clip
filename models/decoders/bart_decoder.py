@@ -3,45 +3,26 @@ import torch.nn as nn
 from transformers import BartForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
+from .base_decoder import BaseDecoder
 
-class BartDecoder(nn.Module):
+
+class BartDecoder(BaseDecoder):
 
     def __init__(self, pretrained_name="facebook/bart-base", ecg_dim=320):
-        super().__init__()
-        # Load pretrained BART model (encoder-decoder model)
-        # reuse ONLY the decoder part, and give ECG features as encoder outputs.
-        self.model = BartForConditionalGeneration.from_pretrained(pretrained_name)
-        self.model.config._attn_implementation = "eager"
-
-        # project ECG token features to BART hidden size
-        # ECG encoder outputs tokens of dimension ecg_dim (e.g. 320).
-        # BART expects hidden size = self.model.config.d_model (e.g. 768).
-        # So we add a linear projection layer to match dimensions.
-        self.project_ecg = nn.Linear(ecg_dim, self.model.config.d_model)
-
-    def _project_ecg(self, ecg_tokens):
-        ecg_proj = self.project_ecg(ecg_tokens)
-        ecg_attention_mask = ecg_proj.new_ones(
-            ecg_proj.size(0),
-            ecg_proj.size(1),
-            dtype=torch.long,
+        model = BartForConditionalGeneration.from_pretrained(
+            pretrained_name, attn_implementation="eager"
         )
-        return ecg_proj, ecg_attention_mask
+        # Bypass BART's encoder — ECG features are injected as encoder_outputs.
+        model.model.encoder = None
+        super().__init__(ecg_dim=ecg_dim, decoder_hidden_dim=model.config.d_model)
+        self.model = model
 
-    def forward(
-        self,
-        ecg_tokens,        # (B, L, 320)
-        input_ids,         # report tokens
-        attention_mask,  # mask for decoder tokens (ignore padding)
-        labels=None
-    ):
-        # project ECG features to BART hidden size
-        ecg_proj, ecg_attention_mask = self._project_ecg(ecg_tokens)
+    def forward(self, ecg_tokens, input_ids, attention_mask, labels=None):
+        ecg_proj, _ = self._project_ecg(ecg_tokens)
 
         model_kwargs = {
             "encoder_outputs": BaseModelOutput(last_hidden_state=ecg_proj),
-            "encoder_attention_mask": ecg_attention_mask,
-            "return_dict": True,
+            "decoder_attention_mask": attention_mask,
         }
         if labels is not None:
             # For seq2seq training, let HF shift labels internally to avoid
@@ -49,11 +30,8 @@ class BartDecoder(nn.Module):
             model_kwargs["labels"] = labels
         else:
             model_kwargs["decoder_input_ids"] = input_ids
-            model_kwargs["decoder_attention_mask"] = attention_mask
 
-        outputs = self.model(**model_kwargs)
-
-        return outputs
+        return self.model(**model_kwargs)
 
     def generate(
         self,

@@ -3,40 +3,36 @@ import torch.nn as nn
 from transformers import AutoConfig, T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
+from .base_decoder import BaseDecoder
 
-class T5Decoder(nn.Module):
 
-    def __init__(self, pretrained_name="google/flan-t5-base", ecg_dim=320, max_ecg_tokens=512):
-        super().__init__()
+class _EncoderStub(nn.Module):
+    """Minimal stub so T5's .generate() can access encoder attributes."""
+    main_input_name = "input_ids"
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("T5Decoder uses encoder_outputs directly; encoder should not be called.")
+
+
+class T5Decoder(BaseDecoder):
+
+    def __init__(self, pretrained_name="google/flan-t5-base", ecg_dim=320):
         config = AutoConfig.from_pretrained(pretrained_name)
         config.tie_word_embeddings = False
-        self.model = T5ForConditionalGeneration.from_pretrained(pretrained_name, config=config)
-        self.project_ecg = nn.Linear(ecg_dim, self.model.config.d_model)
-        # Kept for interface compatibility but intentionally unused for now.
-        self.max_ecg_tokens = int(max_ecg_tokens) if max_ecg_tokens is not None else 0
+        model = T5ForConditionalGeneration.from_pretrained(pretrained_name, config=config)
+        # Replace T5's encoder with a lightweight stub — ECG features are
+        # injected as encoder_outputs, but .generate() still needs the
+        # encoder attribute to exist for introspection.
+        model.encoder = _EncoderStub()
+        super().__init__(ecg_dim=ecg_dim, decoder_hidden_dim=model.config.d_model)
+        self.model = model
 
-    def _project_ecg(self, ecg_tokens):
-        ecg_proj = self.project_ecg(ecg_tokens)
-        ecg_attention_mask = ecg_proj.new_ones(
-            ecg_proj.size(0),
-            ecg_proj.size(1),
-            dtype=torch.long,
-        )
-        return ecg_proj, ecg_attention_mask
-
-    def forward(
-        self,
-        ecg_tokens,
-        input_ids,
-        attention_mask,
-        labels=None,
-    ):
-        ecg_proj, ecg_attention_mask = self._project_ecg(ecg_tokens)
+    def forward(self, ecg_tokens, input_ids, attention_mask, labels=None):
+        ecg_proj, _ = self._project_ecg(ecg_tokens)
 
         model_kwargs = {
             "encoder_outputs": BaseModelOutput(last_hidden_state=ecg_proj),
-            "encoder_attention_mask": ecg_attention_mask,
-            "return_dict": True,
+            "decoder_attention_mask": attention_mask,
         }
         if labels is not None:
             # For seq2seq training, let HF shift labels internally to avoid
@@ -44,10 +40,8 @@ class T5Decoder(nn.Module):
             model_kwargs["labels"] = labels
         else:
             model_kwargs["decoder_input_ids"] = input_ids
-            model_kwargs["decoder_attention_mask"] = attention_mask
 
-        outputs = self.model(**model_kwargs)
-        return outputs
+        return self.model(**model_kwargs)
 
     def generate(
         self,

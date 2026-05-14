@@ -11,7 +11,7 @@ def _flag_was_provided(flag):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate CoCa checkpoint (test loss + generation)")
-    parser.add_argument("--data_root", type=str, default="/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ra59ver2/ptb-xl-project/files/ptb-xl/1.0.3")
+    parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--language_model_path", type=str, default="emilyalsentzer/Bio_ClinicalBERT")
     parser.add_argument("--decoder_model_path", type=str, default=None)
     parser.add_argument("--decoder_tokenizer_path", type=str, default=None)
@@ -21,19 +21,8 @@ def parse_args():
     parser.add_argument("--ts_model_path", type=str, default="ts2vec_pretrained.pt")
     parser.add_argument("--patchtst_pretrained_name", type=str, default=None)
     parser.add_argument("--ts_arch", type=str, default="ts2vec", choices=["ts2vec", "patchtst"])
-    parser.add_argument("--language_arch", type=str, default="bioclinicalbert")
-    parser.add_argument(
-        "--decoder_arch",
-        type=str,
-        default="bart",
-        choices=["bart", "gpt2", "t5", "flant5", "flan_t5", "flan-t5", "biogpt"],
-    )
-    parser.add_argument(
-        "--decoder_max_ecg_tokens",
-        type=int,
-        default=512,
-        help="Maximum ECG tokens passed to decoder cross-attention. <=0 disables downsampling.",
-    )
+    parser.add_argument("--language_arch", type=str, default="bioclinicalbert", choices=["bert", "bioclinicalbert"])
+    parser.add_argument("--decoder_arch", type=str, default="bart", choices=["bart", "gpt2", "t5", "biogpt"])
     parser.add_argument("--head_arch", type=str, default="mlp")
     parser.add_argument("--projection_dim", type=int, default=128)
     parser.add_argument("--caption_loss_weight", type=float, default=1.0)
@@ -48,10 +37,19 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--sampling_rate", type=int, default=500, choices=[100, 500])
     parser.add_argument("--text_max_length", type=int, default=128)
-    parser.add_argument("--text_source", type=str, default="report", choices=["report", "pseudo_report"])
+    parser.add_argument("--dataset", type=str, default="ptbxl", choices=["ptbxl", "mimic"])
+    parser.add_argument("--text_source", type=str, default="report",
+                        choices=["report", "pseudo_report", "note"])
     parser.add_argument("--return_labels", action="store_true")
     parser.add_argument("--label_col", type=str, default="scp_codes")
     parser.add_argument("--label_threshold", type=float, default=0.0)
+    parser.add_argument("--normalize_mode", type=str, default="global",
+                        choices=["global"])
+    parser.add_argument("--mimic_notes_root", type=str, default=None)
+    parser.add_argument("--mimic_demographics_dir", type=str, default=None)
+    parser.add_argument("--mimic_folds_file", type=str, default="mimic_folds.csv",
+                        help="CSV with subject_id,strat_fold columns")
+    parser.add_argument("--mimic_max_samples", type=int, default=None)
 
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)

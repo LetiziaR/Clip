@@ -1,370 +1,488 @@
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+"""
+CoCa training script.
+
+Supports optional Dirichlet classification via --use-dirichlet:
+  1. A Dirichlet classification head that predicts disease concentration
+     parameters instead of raw logits, giving calibrated class
+     probabilities and an uncertainty estimate per sample.
+  2. Disease-context tokens (predicted probabilities + confidence) are
+     prepended to the ECG temporal tokens so that the caption decoder
+     can attend to the classification output.
+
+Usage
+-----
+    # Base CoCa (contrastive + captioning)
+    python run_coca.py --config configs/default.yaml
+
+    # With Dirichlet classification
+    python run_coca.py --config configs/default.yaml \\
+        --use-dirichlet \\
+        --override data.return_labels=True \\
+        --wandb
+"""
+
 import os
 import csv
-import json
 import argparse
-import random
-import numpy as np
 from datetime import datetime
 
-from data.ptbxl_dataset import PTBXL
-from models.coca import CoCa
-from trainer.coca_trainer import CoCaTrainer
+import torch
+import torch.optim as optim
+import torch.distributed as dist
 
+from config import CoCaConfig
+from models.coca import CoCa
+from training.common import (
+    set_seed, init_distributed, save_json,
+    safe_save_checkpoint, build_tokenizers, build_dataset, build_loader,
+)
+from training.coca_trainer import CoCaTrainer
+
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run CoCa training on PTB-XL")
-    parser.add_argument("--data_root", type=str, default="/dss/dssmcmlfs01/pr74ze/pr74ze-dss-0001/ra59ver2/ptb-xl-project/files/ptb-xl/1.0.3")
-    parser.add_argument("--language_model_path", type=str, default="emilyalsentzer/Bio_ClinicalBERT")
-    parser.add_argument("--decoder_model_path", type=str, default=None)
-    parser.add_argument("--decoder_tokenizer_path", type=str, default=None)
-    parser.add_argument("--dual_tokenizer", dest="dual_tokenizer", action="store_true")
-    parser.add_argument("--no_dual_tokenizer", dest="dual_tokenizer", action="store_false")
-    parser.set_defaults(dual_tokenizer=True)
-    parser.add_argument("--ts_model_path", type=str, default="ts2vec_pretrained.pt")
-    parser.add_argument("--patchtst_pretrained_name", type=str, default=None)
-    parser.add_argument("--ts_arch", type=str, default="ts2vec", choices=["ts2vec", "patchtst"])
-    parser.add_argument("--language_arch", type=str, default="bioclinicalbert")
-    parser.add_argument(
-        "--decoder_arch",
-        type=str,
-        default="bart",
-        choices=["bart", "gpt2", "t5", "flant5", "flan_t5", "flan-t5", "biogpt"],
-    )
-    parser.add_argument(
-        "--decoder_max_ecg_tokens",
-        type=int,
-        default=512,
-        help="Maximum ECG tokens passed to decoder cross-attention. <=0 disables downsampling.",
-    )
-    parser.add_argument("--head_arch", type=str, default="mlp")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--projection_dim", type=int, default=128)
-    parser.add_argument("--caption_loss_weight", type=float, default=1.0)
-    parser.add_argument("--contrastive_loss_weight", type=float, default=1.0)
-    parser.add_argument("--aux_classification_loss_weight", type=float, default=0.0)
-    parser.add_argument("--enable_grouped_aux_heads", action="store_true")
-    parser.add_argument("--disable_grouped_aux_heads", dest="enable_grouped_aux_heads", action="store_false")
-    parser.set_defaults(enable_grouped_aux_heads=False)
-    parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--sampling_rate", type=int, default=500, choices=[100, 500])
-    parser.add_argument("--text_max_length", type=int, default=128) #input text max length for both encoder and decoder (if dual_tokenizer=False)
-    parser.add_argument("--text_source", type=str, default="report", choices=["report", "pseudo_report"])
-    parser.add_argument("--return_labels", action="store_true")
-    parser.add_argument("--label_col", type=str, default="scp_codes")
-    parser.add_argument("--label_threshold", type=float, default=0.0)
-    parser.add_argument("--checkpoint_dir", type=str, default="/dss/dsshome1/0F/ra59ver2/Progects/coca/checkpoints")
-    parser.add_argument("--checkpoint_name", type=str, default="coca")
-    parser.add_argument("--run_name", type=str, default=None)
-    parser.add_argument("--skip_test", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--early_stopping_patience", type=int, default=0)
-    parser.add_argument("--early_stopping_min_delta", type=float, default=0.0)
-    parser.add_argument("--save_optimizer_state", dest="save_optimizer_state", action="store_true")
-    parser.add_argument("--no_save_optimizer_state", dest="save_optimizer_state", action="store_false")
-    parser.set_defaults(save_optimizer_state=False)
+    parser = argparse.ArgumentParser(description="CoCa training")
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
+    parser.add_argument("--override", nargs="*", default=[],
+                        help="Config overrides in section.key=value format")
+    # Dirichlet classification
+    parser.add_argument("--use-dirichlet", action="store_true",
+                        help="Enable Dirichlet classification head")
+    parser.add_argument("--dirichlet-use-text", action="store_true", default=False,
+                        help="Concatenate [ts_global ; text_cls] as input to DirichletHead")
+    parser.add_argument("--no-uncertainty", dest="use_uncertainty",
+                        action="store_false", default=True,
+                        help="Probs-only mode: exclude uncertainty from disease context")
+    parser.add_argument("--no-disease-tokens", action="store_true", default=False,
+                        help="Ablation: zero out disease context tokens (classification still trains)")
+    # Resume
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint (.pt) to resume training from. "
+                             "Loads model, optimizer, scheduler, epoch, best_val_loss.")
+    # W&B
+    parser.add_argument("--wandb", action="store_true",
+                        help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="coca-ecg",
+                        help="W&B project name")
+    parser.add_argument("--wandb-tags", nargs="*", default=[],
+                        help="W&B run tags")
     return parser.parse_args()
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def get_run_name(cfg):
+    if cfg.training.run_name:
+        return cfg.training.run_name
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = "classif" if cfg.model.use_dirichlet else "base"
+    return f"coca_{tag}_{cfg.model.ts_arch}_{cfg.model.decoder_arch}_{cfg.data.text_source}_{ts}"
 
 
-def get_run_name(args):
-    if args.run_name:
-        return args.run_name
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{args.checkpoint_name}_{args.ts_arch}_{args.decoder_arch}_{args.text_source}_{timestamp}"
-
-
-def save_json(path, payload):
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
-
-
-def _atomic_torch_save(payload, path):
-    tmp_path = f"{path}.tmp"
-    if os.path.exists(tmp_path):
-        os.remove(tmp_path)
-    try:
-        torch.save(payload, tmp_path)
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-def safe_save_checkpoint(payload, path, allow_model_only_fallback=True):
-    try:
-        _atomic_torch_save(payload, path)
-        return "full"
-    except RuntimeError as err:
-        if not allow_model_only_fallback or "model_state_dict" not in payload:
-            raise
-        if "optimizer_state_dict" not in payload:
-            raise
-
-        # Large seq2seq checkpoints can fail when writing giant optimizer state blobs.
-        msg = str(err)
-        print(f"Warning: full checkpoint save failed for {path}: {msg}")
-        reduced_payload = dict(payload)
-        reduced_payload.pop("optimizer_state_dict", None)
-        _atomic_torch_save(reduced_payload, path)
-        print(f"Saved model-only checkpoint at {path} (optimizer state omitted).")
-        return "model_only"
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
-    if args.enable_grouped_aux_heads and not args.return_labels:
-        print("[INFO] Enabling --return_labels because grouped auxiliary heads require clinical labels.")
-        args.return_labels = True
-    set_seed(args.seed)
+    cfg = CoCaConfig.from_yaml(args.config)
+    if args.override:
+        cfg.apply_overrides(args.override)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_folds = [1, 2, 3, 4, 5, 6, 7, 8]
-    val_folds = [9]
-    test_folds = [10]
+    # Apply CLI dirichlet flags to config
+    if args.use_dirichlet:
+        cfg.model.use_dirichlet = True
+        cfg.model.dirichlet_use_text = args.dirichlet_use_text
+        cfg.model.use_uncertainty = args.use_uncertainty
+        cfg.model.disable_disease_tokens = args.no_disease_tokens
+        # Force return_labels -- the Dirichlet head needs them
+        if not cfg.data.return_labels:
+            print("Note: forcing data.return_labels=True (required for Dirichlet head).")
+            cfg.data.return_labels = True
 
-    run_name = get_run_name(args)
-    run_dir = os.path.join(args.checkpoint_dir, run_name)
-    os.makedirs(run_dir, exist_ok=True)
+    set_seed(cfg.training.seed)
 
-    encoder_tokenizer = AutoTokenizer.from_pretrained(args.language_model_path)
-    if encoder_tokenizer.pad_token is None:
-        encoder_tokenizer.pad_token = encoder_tokenizer.eos_token
+    is_distributed = init_distributed()
+    rank = dist.get_rank() if is_distributed else 0
+    world_size = dist.get_world_size() if is_distributed else 1
 
-    decoder_tokenizer = None
-    if args.dual_tokenizer:
-        decoder_tok_path = args.decoder_tokenizer_path
-        if decoder_tok_path is None:
-            decoder_tok_path = args.decoder_model_path
-        if decoder_tok_path is None:
-            if args.decoder_arch == "bart":
-                decoder_tok_path = "facebook/bart-base"
-            elif args.decoder_arch == "gpt2":
-                decoder_tok_path = "gpt2"
-            elif args.decoder_arch == "biogpt":
-                decoder_tok_path = "microsoft/biogpt"
-            else:
-                decoder_tok_path = "google/flan-t5-base"
-        decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_tok_path)
-        if decoder_tokenizer.pad_token is None:
-            decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
+    if is_distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train_dataset = PTBXL(
-        root=args.data_root,
-        tokenizer=encoder_tokenizer,
-        encoder_tokenizer=encoder_tokenizer,
-        decoder_tokenizer=decoder_tokenizer,
-        use_dual_tokenizer=args.dual_tokenizer,
-        sampling_rate=args.sampling_rate,
-        folds=train_folds,
-        text_max_length=args.text_max_length,
-        text_source=args.text_source,
-        return_labels=args.return_labels,
-        label_col=args.label_col,
-        label_threshold=args.label_threshold,
-    )
+    run_name = get_run_name(cfg)
+    run_dir = os.path.join(cfg.paths.checkpoint_dir, run_name)
+    if rank == 0:
+        os.makedirs(run_dir, exist_ok=True)
+    if is_distributed:
+        dist.barrier()
 
-    shared_label_map = getattr(train_dataset, "label_map", None)
+    # -- W&B init (rank 0 only) --
+    use_wandb = args.wandb and _WANDB_AVAILABLE and rank == 0
+    if use_wandb:
+        tags = args.wandb_tags or [cfg.model.ts_arch, cfg.model.decoder_arch, cfg.data.text_source]
+        if cfg.model.use_dirichlet:
+            tags.append("dirichlet")
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config=cfg.to_dict(),
+            tags=tags,
+            dir=run_dir,
+        )
 
-    val_dataset = PTBXL(
-        root=args.data_root,
-        tokenizer=encoder_tokenizer,
-        encoder_tokenizer=encoder_tokenizer,
-        decoder_tokenizer=decoder_tokenizer,
-        use_dual_tokenizer=args.dual_tokenizer,
-        sampling_rate=args.sampling_rate,
-        folds=val_folds,
-        text_max_length=args.text_max_length,
-        text_source=args.text_source,
-        return_labels=args.return_labels,
-        label_col=args.label_col,
-        label_threshold=args.label_threshold,
-        label_map=shared_label_map,
-    )
+    encoder_tokenizer, decoder_tokenizer = build_tokenizers(cfg)
 
-    test_dataset = PTBXL(
-        root=args.data_root,
-        tokenizer=encoder_tokenizer,
-        encoder_tokenizer=encoder_tokenizer,
-        decoder_tokenizer=decoder_tokenizer,
-        use_dual_tokenizer=args.dual_tokenizer,
-        sampling_rate=args.sampling_rate,
-        folds=test_folds,
-        text_max_length=args.text_max_length,
-        text_source=args.text_source,
-        return_labels=args.return_labels,
-        label_col=args.label_col,
-        label_threshold=args.label_threshold,
-        label_map=shared_label_map,
-    )
+    train_ds = build_dataset(cfg, list(range(1, 9)), encoder_tokenizer, decoder_tokenizer)
+    label_map = getattr(train_ds, "label_map", None)
+    val_ds = build_dataset(cfg, [9], encoder_tokenizer, decoder_tokenizer, label_map=label_map)
+    test_ds = build_dataset(cfg, [10], encoder_tokenizer, decoder_tokenizer, label_map=label_map)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        drop_last=True,
-    )
+    seed = cfg.training.seed
+    train_loader = build_loader(train_ds, cfg, rank, world_size, shuffle=True, seed=seed)
+    val_loader = build_loader(val_ds, cfg, rank, world_size, shuffle=False, seed=seed)
+    test_loader = build_loader(test_ds, cfg, rank, world_size, shuffle=False, seed=seed)
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        drop_last=False,
-    )
+    num_classes = len(label_map) if label_map is not None else 0
+    cfg.model.num_classes = num_classes
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        drop_last=False,
-    )
+    if cfg.model.use_dirichlet and num_classes == 0:
+        raise RuntimeError(
+            "No class labels found. Make sure the dataset returns labels "
+            "(data.return_labels=True) and the label column is populated."
+        )
 
-    print(f"Run: {run_name}")
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
-    print(f"Test samples: {len(test_dataset)}")
+    if rank == 0:
+        print(f"Run: {run_name}")
+        print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+        if num_classes > 0:
+            print(f"Classes: {num_classes}")
+
+    patchtst_kwargs = {
+        "context_length": cfg.model.patchtst_context_length,
+        "patch_length": cfg.model.patchtst_patch_length,
+        "patch_stride": cfg.model.patchtst_patch_stride,
+        "d_model": cfg.model.patchtst_d_model,
+        "num_hidden_layers": cfg.model.patchtst_num_layers,
+        "num_attention_heads": cfg.model.patchtst_num_heads,
+        "ffn_dim": cfg.model.patchtst_ffn_dim,
+        "dropout": cfg.model.patchtst_dropout,
+    } if cfg.model.ts_arch == "patchtst" else None
 
     label_names = None
     if shared_label_map is not None:
         label_names = [name for name, _ in sorted(shared_label_map.items(), key=lambda kv: kv[1])]
 
     model = CoCa(
-        ts_arch=args.ts_arch,
-        language_arch=args.language_arch,
-        decoder_arch=args.decoder_arch,
-        decoder_pretrained_name=args.decoder_model_path,
-        decoder_max_ecg_tokens=args.decoder_max_ecg_tokens,
-        head_arch=args.head_arch,
-        ts_pre_train_path=args.ts_model_path,
-        patchtst_pretrained_name=args.patchtst_pretrained_name,
-        language_pre_train_path=args.language_model_path,
-        projection_dim=args.projection_dim,
-        caption_loss_weight=args.caption_loss_weight,
-        contrastive_loss_weight=args.contrastive_loss_weight,
-        aux_classification_loss_weight=args.aux_classification_loss_weight,
-        enable_grouped_aux_heads=args.enable_grouped_aux_heads,
-        label_names=label_names,
-        temperature=args.temperature,
+        ts_arch=cfg.model.ts_arch,
+        language_arch=cfg.model.language_arch,
+        decoder_arch=cfg.model.decoder_arch,
+        decoder_pretrained_name=cfg.paths.decoder_model,
+        head_arch=cfg.model.head_arch,
+        ts_pre_train_path=cfg.paths.ts_pre_train,
+        patchtst_pretrained_name=cfg.paths.patchtst_pretrained_name,
+        language_pre_train_path=cfg.paths.language_model,
+        projection_dim=cfg.model.projection_dim,
+        ts_emb_dim=cfg.model.ts_emb_dim,
+        lang_emb_dim=cfg.model.lang_emb_dim,
+        caption_loss_weight=cfg.model.caption_loss_weight,
+        contrastive_loss_weight=cfg.model.contrastive_loss_weight,
+        num_classes=num_classes,
+        temperature=cfg.model.temperature,
+        use_dirichlet=cfg.model.use_dirichlet,
+        dirichlet_loss_weight=cfg.model.dirichlet_loss_weight,
+        dirichlet_kl_weight=cfg.model.dirichlet_kl_weight,
+        dirichlet_annealing_epochs=cfg.model.dirichlet_annealing_epochs,
+        use_uncertainty=cfg.model.use_uncertainty,
+        dirichlet_use_text=cfg.model.dirichlet_use_text,
+        disable_disease_tokens=cfg.model.disable_disease_tokens,
+        patchtst_kwargs=patchtst_kwargs,
+        use_perceiver=cfg.model.use_perceiver,
+        perceiver_num_latents=cfg.model.perceiver_num_latents,
+        perceiver_depth=cfg.model.perceiver_depth,
+        perceiver_num_heads=cfg.model.perceiver_num_heads,
+        perceiver_dropout=cfg.model.perceiver_dropout,
+        perceiver_mode=cfg.model.perceiver_mode,
     ).to(device)
 
+    if is_distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, find_unused_parameters=True
+        )
+
     optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=1e-4,
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg.training.learning_rate,
+        weight_decay=cfg.training.weight_decay,
     )
+
+    scheduler = None
+    if cfg.training.lr_scheduler == "cosine":
+        total_steps = cfg.training.epochs * len(train_loader)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+
+    pad_id = (decoder_tokenizer.pad_token_id if decoder_tokenizer is not None
+              else encoder_tokenizer.pad_token_id)
 
     trainer = CoCaTrainer(
         model=model,
         optimizer=optimizer,
-        accelerator=None,
-        max_epochs=args.epochs,
-        pad_token_id=(decoder_tokenizer.pad_token_id if decoder_tokenizer is not None else encoder_tokenizer.pad_token_id),
-        save_dir=None,
-        save_name=args.checkpoint_name,
-        save_best_only=False,
+        max_epochs=cfg.training.epochs,
+        pad_token_id=pad_id,
+        scheduler=scheduler,
+        freeze_language=cfg.training.freeze_language,
+        unfreeze_language_layers=cfg.training.unfreeze_language_layers,
+        grad_clip_norm=cfg.training.grad_clip_norm,
     )
+
+    # Serialize full config for reproducibility
+    config_payload = cfg.to_dict()
+    config_payload["run_name"] = run_name
+    config_payload["run_dir"] = run_dir
+    config_payload["device"] = device
+    if rank == 0:
+        save_json(os.path.join(run_dir, "config.json"), config_payload)
+
+    use_dirichlet = cfg.model.use_dirichlet
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     stopped_early = False
     completed_epochs = 0
-    best_ckpt_path = os.path.join(run_dir, "best.pt")
-    last_ckpt_path = os.path.join(run_dir, "last.pt")
-    metrics_csv_path = os.path.join(run_dir, "metrics.csv")
+    start_epoch = 1
+    best_ckpt = os.path.join(run_dir, "best.pt")
+    last_ckpt = os.path.join(run_dir, "last.pt")
+    metrics_csv = os.path.join(run_dir, "metrics.csv")
 
-    config_payload = vars(args).copy()
-    config_payload["device"] = device
-    config_payload["run_name"] = run_name
-    config_payload["run_dir"] = run_dir
-    if shared_label_map is not None:
-        config_payload["num_labels"] = len(shared_label_map)
-    save_json(os.path.join(run_dir, "config.json"), config_payload)
+    # -- Resume from checkpoint --
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"--resume path not found: {args.resume}")
+        if rank == 0:
+            print(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        target = model.module if is_distributed else model
+        target.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        elif rank == 0:
+            print("Warning: checkpoint has no optimizer_state_dict; optimizer restarts fresh.")
+        if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        elif scheduler is not None and rank == 0:
+            print("Warning: checkpoint has no scheduler_state_dict; scheduler restarts fresh.")
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        epochs_without_improvement = int(ckpt.get("epochs_without_improvement", 0))
+        completed_epochs = start_epoch - 1
+        if rank == 0:
+            print(f"Resumed at epoch {start_epoch} (best_val_loss={best_val_loss:.4f})")
 
-    with open(metrics_csv_path, "w", newline="", encoding="utf-8") as fp:
-        writer = csv.writer(fp)
-        writer.writerow(["epoch", "train_loss", "val_loss", "best_val_loss"])
+    csv_fp = None
+    csv_writer = None
+    if rank == 0:
+        csv_mode = "a" if (args.resume and os.path.exists(metrics_csv)) else "w"
+        csv_fp = open(metrics_csv, csv_mode, newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_fp)
+        header = [
+            "epoch",
+            "train_loss", "train_caption", "train_contrastive",
+        ]
+        if use_dirichlet:
+            header += ["train_dirichlet", "train_mean_uncertainty"]
+        header += [
+            "val_loss", "val_caption", "val_contrastive",
+        ]
+        if use_dirichlet:
+            header += [
+                "val_dirichlet", "val_mean_uncertainty",
+                "val_classif_accuracy", "val_macro_f1",
+            ]
+        header += [
+            "val_ecg2text_R@1", "val_ecg2text_R@5",
+            "val_text2ecg_R@1", "val_text2ecg_R@5",
+            "best_val_loss",
+        ]
+        if csv_mode == "w":
+            csv_writer.writerow(header)
 
-        for epoch in range(1, args.epochs + 1):
-            train_loss = trainer.train_one_epoch(data_loader=train_loader, epoch=epoch)
-            val_loss = trainer.evaluate(val_loader)
-            completed_epochs = epoch
+    for epoch in range(start_epoch, cfg.training.epochs + 1):
+        if is_distributed:
+            train_loader.sampler.set_epoch(epoch)
 
-            improved = val_loss < (best_val_loss - args.early_stopping_min_delta)
+        train_m = trainer.train_one_epoch(data_loader=train_loader, epoch=epoch)
+        val_m = trainer.evaluate(val_loader)
 
+        completed_epochs = epoch
+        val_loss = val_m["loss"]
+        improved = val_loss < (best_val_loss - cfg.training.early_stopping_min_delta)
+
+        if improved:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        model_state = (model.module if is_distributed else model).state_dict()
+        ckpt_payload = {
+            "epoch": epoch,
+            "model_state_dict": model_state,
+            "train_loss": train_m["loss"],
+            "val_loss": val_loss,
+            "best_val_loss": best_val_loss,
+            "epochs_without_improvement": epochs_without_improvement,
+            "config": config_payload,
+        }
+        if cfg.training.save_optimizer_state:
+            ckpt_payload["optimizer_state_dict"] = optimizer.state_dict()
+        if scheduler is not None:
+            ckpt_payload["scheduler_state_dict"] = scheduler.state_dict()
+
+        if rank == 0:
+            safe_save_checkpoint(ckpt_payload, last_ckpt)
             if improved:
-                best_val_loss = val_loss
-                epochs_without_improvement = 0
-                best_payload = {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "best_val_loss": best_val_loss,
-                    "config": config_payload,
-                }
-                if args.save_optimizer_state:
-                    best_payload["optimizer_state_dict"] = optimizer.state_dict()
-                safe_save_checkpoint(best_payload, best_ckpt_path, allow_model_only_fallback=True)
+                safe_save_checkpoint(ckpt_payload, best_ckpt)
+
+        if csv_writer is not None:
+            row = [
+                epoch,
+                f"{train_m['loss']:.6f}",
+                f"{train_m['caption_loss']:.6f}",
+                f"{train_m['contrastive_loss']:.6f}",
+            ]
+            if use_dirichlet:
+                row += [
+                    f"{train_m['dirichlet_loss']:.6f}",
+                    f"{train_m.get('mean_uncertainty', 0):.4f}",
+                ]
+            row += [
+                f"{val_m['loss']:.6f}",
+                f"{val_m['caption_loss']:.6f}",
+                f"{val_m['contrastive_loss']:.6f}",
+            ]
+            if use_dirichlet:
+                row += [
+                    f"{val_m['dirichlet_loss']:.6f}",
+                    f"{val_m.get('mean_uncertainty', 0):.4f}",
+                    f"{val_m.get('classif_accuracy', 0):.4f}",
+                    f"{val_m.get('macro_f1', 0):.4f}",
+                ]
+            row += [
+                f"{val_m.get('ecg2text_R@1', 0):.4f}",
+                f"{val_m.get('ecg2text_R@5', 0):.4f}",
+                f"{val_m.get('text2ecg_R@1', 0):.4f}",
+                f"{val_m.get('text2ecg_R@5', 0):.4f}",
+                f"{best_val_loss:.6f}",
+            ]
+            csv_writer.writerow(row)
+            csv_fp.flush()
+
+        if rank == 0:
+            r1 = val_m.get("ecg2text_R@1", 0)
+            r5 = val_m.get("ecg2text_R@5", 0)
+            parts = [
+                f"Epoch [{epoch}/{cfg.training.epochs}] "
+                f"Train: {train_m['loss']:.4f} "
+                f"(cap={train_m['caption_loss']:.4f} "
+                f"con={train_m['contrastive_loss']:.4f}",
+            ]
+            if use_dirichlet:
+                parts.append(f" dir={train_m['dirichlet_loss']:.4f})")
             else:
-                epochs_without_improvement += 1
+                parts.append(")")
+            parts.append(f" | Val: {val_loss:.4f} | R@1={r1:.3f} R@5={r5:.3f}")
+            if use_dirichlet:
+                acc = val_m.get("classif_accuracy", 0)
+                f1 = val_m.get("macro_f1", 0)
+                unc = val_m.get("mean_uncertainty", 0)
+                parts.append(f" | Acc={acc:.3f} F1={f1:.3f} Unc={unc:.3f}")
+            parts.append(f" | Best: {best_val_loss:.4f}")
+            print("".join(parts))
 
-            writer.writerow([epoch, f"{train_loss:.8f}", f"{val_loss:.8f}", f"{best_val_loss:.8f}"])
-            fp.flush()
+        if use_wandb:
+            log_dict = {
+                "epoch": epoch,
+                "train/loss": train_m["loss"],
+                "train/caption_loss": train_m["caption_loss"],
+                "train/contrastive_loss": train_m["contrastive_loss"],
+                "val/loss": val_loss,
+                "val/caption_loss": val_m["caption_loss"],
+                "val/contrastive_loss": val_m["contrastive_loss"],
+                "val/ecg2text_R@1": val_m.get("ecg2text_R@1", 0),
+                "val/ecg2text_R@5": val_m.get("ecg2text_R@5", 0),
+                "val/text2ecg_R@1": val_m.get("text2ecg_R@1", 0),
+                "val/text2ecg_R@5": val_m.get("text2ecg_R@5", 0),
+                "val/best_val_loss": best_val_loss,
+                "lr": optimizer.param_groups[0]["lr"],
+            }
+            if use_dirichlet:
+                log_dict.update({
+                    "train/dirichlet_loss": train_m["dirichlet_loss"],
+                    "train/mean_uncertainty": train_m.get("mean_uncertainty", 0),
+                    "val/dirichlet_loss": val_m["dirichlet_loss"],
+                    "val/mean_uncertainty": val_m.get("mean_uncertainty", 0),
+                    "val/classif_accuracy": val_m.get("classif_accuracy", 0),
+                    "val/macro_f1": val_m.get("macro_f1", 0),
+                })
+            wandb.log(log_dict, step=epoch)
 
-            print(
-                f"Epoch [{epoch}/{args.epochs}] - "
-                f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                f"Best Val: {best_val_loss:.4f}"
-            )
+        patience = cfg.training.early_stopping_patience
+        if patience > 0 and epochs_without_improvement >= patience:
+            stopped_early = True
+            if rank == 0:
+                print(f"Early stopping: no improvement for {epochs_without_improvement} epochs.")
+            break
 
-            if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
-                stopped_early = True
-                print(
-                    "Early stopping triggered: "
-                    f"no val improvement for {epochs_without_improvement} epoch(s) "
-                    f"(patience={args.early_stopping_patience}, min_delta={args.early_stopping_min_delta})."
-                )
-                break
+    if csv_fp is not None:
+        csv_fp.close()
 
-    last_payload = {
-        "epoch": completed_epochs,
-        "model_state_dict": model.state_dict(),
-        "best_val_loss": best_val_loss,
-        "config": config_payload,
-    }
-    if args.save_optimizer_state:
-        last_payload["optimizer_state_dict"] = optimizer.state_dict()
-    safe_save_checkpoint(last_payload, last_ckpt_path, allow_model_only_fallback=True)
-
-    if os.path.exists(best_ckpt_path):
-        checkpoint = torch.load(best_ckpt_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        print(f"Loaded best checkpoint from epoch {checkpoint['epoch']}")
+    # Test evaluation with best checkpoint
+    if os.path.exists(best_ckpt):
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+        target = model.module if is_distributed else model
+        target.load_state_dict(ckpt["model_state_dict"])
+        if rank == 0:
+            print(f"Loaded best checkpoint from epoch {ckpt['epoch']}")
 
     test_loss = None
-    if not args.skip_test:
-        test_loss = trainer.evaluate(test_loader)
-        print(f"Final Test Loss: {test_loss:.4f}")
-    else:
-        print("Skipping test evaluation (--skip_test).")
+    if not cfg.training.skip_test:
+        test_m = trainer.evaluate(test_loader)
+        test_loss = test_m["loss"]
+        if rank == 0:
+            tr1 = test_m.get("ecg2text_R@1", 0)
+            tr5 = test_m.get("ecg2text_R@5", 0)
+            parts = [f"Test Loss: {test_loss:.4f} | R@1={tr1:.3f} R@5={tr5:.3f}"]
+            if use_dirichlet:
+                acc = test_m.get("classif_accuracy", 0)
+                f1 = test_m.get("macro_f1", 0)
+                unc = test_m.get("mean_uncertainty", 0)
+                parts.append(f" | Acc={acc:.3f} F1={f1:.3f} Unc={unc:.3f}")
+            print("".join(parts))
+        if use_wandb:
+            test_log = {
+                "test/loss": test_loss,
+                "test/ecg2text_R@1": test_m.get("ecg2text_R@1", 0),
+                "test/ecg2text_R@5": test_m.get("ecg2text_R@5", 0),
+                "test/text2ecg_R@1": test_m.get("text2ecg_R@1", 0),
+                "test/text2ecg_R@5": test_m.get("text2ecg_R@5", 0),
+            }
+            if use_dirichlet:
+                test_log.update({
+                    "test/classif_accuracy": test_m.get("classif_accuracy", 0),
+                    "test/macro_f1": test_m.get("macro_f1", 0),
+                    "test/mean_uncertainty": test_m.get("mean_uncertainty", 0),
+                })
+            wandb.log(test_log)
 
     summary = {
         "run_name": run_name,
@@ -372,14 +490,20 @@ def main():
         "stopped_early": stopped_early,
         "best_val_loss": best_val_loss,
         "test_loss": test_loss,
-        "best_checkpoint": best_ckpt_path,
-        "last_checkpoint": last_ckpt_path,
-        "metrics_csv": metrics_csv_path,
+        "best_checkpoint": best_ckpt,
+        "last_checkpoint": last_ckpt,
+        "metrics_csv": metrics_csv,
     }
-    save_json(os.path.join(run_dir, "summary.json"), summary)
+    if rank == 0:
+        save_json(os.path.join(run_dir, "summary.json"), summary)
+        print(f"Artifacts saved in: {run_dir}")
+        print("Training finished.")
 
-    print(f"Artifacts saved in: {run_dir}")
-    print("Training finished.")
+    if use_wandb:
+        wandb.finish()
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
-import re
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def get_head(head_arch: str, embedding_dim: int, projection_dim: int):
@@ -17,100 +18,185 @@ def get_head(head_arch: str, embedding_dim: int, projection_dim: int):
         return nn.Linear(embedding_dim, projection_dim)
 
     elif head_arch == "mlp":
-        # 2-layer MLP projection (very common in contrastive learning)
+        # 2-layer MLP with BatchNorm (SimCLR convention).
+        # Hidden dim = embedding_dim preserves capacity before the non-linearity.
+        # BatchNorm stabilises contrastive training and prevents representation collapse.
         return nn.Sequential(
-            nn.Linear(embedding_dim, projection_dim),
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
             nn.ReLU(),
-            nn.Linear(projection_dim, projection_dim)
+            nn.Linear(embedding_dim, projection_dim)
         )
 
     else:
         raise ValueError(f"Unsupported head architecture: {head_arch}")
 
 
-class GroupedAuxiliaryHeads(nn.Module):
-    """Multiple independent multilabel heads over clinically grouped labels."""
+# ---------------------------------------------------------------------------
+# Dirichlet classification head
+# ---------------------------------------------------------------------------
 
-    def __init__(self, embedding_dim: int, group_to_indices: dict[str, list[int]]):
+class DirichletHead(nn.Module):
+    """K independent Beta heads for multi-label evidential classification.
+
+    Each of the K classes is modelled as an independent Beta(alpha_k, beta_k)
+    distribution — the 2-class Dirichlet.  This allows any combination of
+    classes to be predicted simultaneously (multi-label).
+
+    For each class k:
+        evidence_pos, evidence_neg = softplus(logits)   (> 0)
+        alpha_k = evidence_pos + 1                      (>= 1)
+        beta_k  = evidence_neg + 1                      (>= 1)
+        prob_k  = alpha_k / (alpha_k + beta_k)          (Beta mean)
+        unc_k   = 2 / (alpha_k + beta_k)                (0 = certain, 1 = max unc)
+
+    Returns alpha (B, K, 2) with alpha[:,:,0] = alpha_pos, alpha[:,:,1] = beta,
+    probs (B, K), and uncertainty (B, K).
+    """
+
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: Optional[int] = None):
         super().__init__()
-        if not group_to_indices:
-            raise ValueError("group_to_indices must not be empty")
+        self.num_classes = num_classes
+        hidden_dim = hidden_dim or input_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes * 2),   # 2 params per class
+        )
 
-        cleaned = {}
-        for group, indices in group_to_indices.items():
-            unique = sorted({int(i) for i in indices})
-            if unique:
-                cleaned[group] = unique
-        if not cleaned:
-            raise ValueError("group_to_indices has no non-empty groups")
-
-        self.group_to_indices = cleaned
-        self.heads = nn.ModuleDict({
-            group: nn.Linear(embedding_dim, len(indices))
-            for group, indices in cleaned.items()
-        })
-
-    def forward(self, embedding: torch.Tensor) -> dict[str, torch.Tensor]:
-        return {group: head(embedding) for group, head in self.heads.items()}
-
-    def compute_loss(self, embedding: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
-        logits_by_group = self.forward(embedding)
-        losses = []
-        group_loss_values = {}
-        labels = labels.float()
-
-        for group, logits in logits_by_group.items():
-            indices = self.group_to_indices[group]
-            target = labels[:, indices]
-            group_loss = nn.functional.binary_cross_entropy_with_logits(logits, target)
-            losses.append(group_loss)
-            group_loss_values[f"aux_{group}_loss"] = float(group_loss.detach().item())
-
-        total_aux_loss = torch.stack(losses).mean()
-        group_loss_values["aux_grouped_loss"] = float(total_aux_loss.detach().item())
-        return total_aux_loss, group_loss_values
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: (B, input_dim) -- typically ``ts_global``.
+        Returns:
+            alpha:       (B, K, 2) -- Beta concentration params [alpha, beta] per class.
+            probs:       (B, K)    -- per-class probabilities (Beta mean).
+            uncertainty: (B, K)    -- per-class uncertainty.
+        """
+        logits = self.net(x)                                     # (B, 2K)
+        logits = logits.view(-1, self.num_classes, 2)            # (B, K, 2)
+        evidence = F.softplus(logits)                            # (B, K, 2), > 0
+        alpha = evidence + 1.0                                   # (B, K, 2), >= 1
+        S = alpha.sum(dim=-1)                                    # (B, K)
+        probs = alpha[:, :, 0] / S                               # (B, K)
+        uncertainty = 2.0 / S                                    # (B, K)
+        return alpha, probs, uncertainty
 
 
-def build_ptbxl_grouped_label_indices(label_names: list[str]) -> dict[str, list[int]]:
-    """Heuristic grouping for PTB-XL SCP labels into clinical families."""
+# ---------------------------------------------------------------------------
+# Disease conditioner  (additive bias on ECG tokens)
+# ---------------------------------------------------------------------------
 
-    rhythm_patterns = [
-        r"AFIB|AFLT|SBRAD|STACH|SVT|VT|PAC|PVC|ARR|RHY|TRIG|BIGEM|JUN|SINUS",
-    ]
-    conduction_patterns = [
-        r"AVB|IAVB|1AVB|2AVB|3AVB|RBBB|LBBB|IRBBB|CLBBB|CRBBB|FASC|LAFB|LPFB|IVCD|WPW|BBB",
-    ]
-    ischemia_patterns = [
-        r"ISC|ISCH|MI|AMI|IMI|ASMI|ALMI|ILMI|INJ|STE|STD|NSTEMI|STEMI|QWAVE",
-    ]
-    hypertrophy_patterns = [
-        r"LVH|RVH|LAE|RAE|HYP|LAD|RAD|AXIS|LQT|QT|STTC|TINV|LOWV",
-    ]
+class DiseaseConditioner(nn.Module):
+    """Project disease predictions into context tokens for the decoder.
 
-    grouped = {
-        "rhythm": [],
-        "conduction": [],
-        "ischemia_infarction": [],
-        "hypertrophy_axis_repolarization": [],
-        "other": [],
-    }
+    Produces ``num_tokens`` vectors of dimension ``ecg_dim`` that are
+    **prepended** to the ECG temporal tokens so the decoder can
+    cross-attend to disease information selectively.
 
-    compiled = {
-        "rhythm": [re.compile(p) for p in rhythm_patterns],
-        "conduction": [re.compile(p) for p in conduction_patterns],
-        "ischemia_infarction": [re.compile(p) for p in ischemia_patterns],
-        "hypertrophy_axis_repolarization": [re.compile(p) for p in hypertrophy_patterns],
-    }
+    When ``use_uncertainty=True`` the conditioner receives per-class
+    uncertainty ``(B, K)`` concatenated with the probabilities, giving
+    an input of dimension ``2*K``.
+    """
 
-    for idx, name in enumerate(label_names):
-        normalized = str(name).upper()
-        assigned = False
-        for group, patterns in compiled.items():
-            if any(p.search(normalized) for p in patterns):
-                grouped[group].append(idx)
-                assigned = True
-                break
-        if not assigned:
-            grouped["other"].append(idx)
+    def __init__(self, num_classes: int, ecg_dim: int,
+                 use_uncertainty: bool = True, num_tokens: int = 1):
+        super().__init__()
+        self.use_uncertainty = use_uncertainty
+        self.num_tokens = num_tokens
+        self.ecg_dim = ecg_dim
+        input_dim = num_classes * 2 if use_uncertainty else num_classes
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, ecg_dim),
+            nn.ReLU(),
+            nn.Linear(ecg_dim, ecg_dim * num_tokens),
+        )
 
-    return {group: indices for group, indices in grouped.items() if indices}
+    def forward(self, disease_probs: torch.Tensor,
+                uncertainty: Optional[torch.Tensor] = None):
+        """
+        Args:
+            disease_probs: (B, K)
+            uncertainty:   (B, K) — ignored when ``use_uncertainty=False``.
+        Returns:
+            disease_tokens: (B, num_tokens, ecg_dim) — prepend to ECG tokens.
+        """
+        if self.use_uncertainty:
+            if uncertainty is None:
+                raise ValueError(
+                    "uncertainty must be provided when use_uncertainty=True")
+            x = torch.cat([disease_probs, uncertainty], dim=-1)    # (B, 2K)
+        else:
+            x = disease_probs                                      # (B, K)
+        out = self.proj(x)                                         # (B, ecg_dim * T)
+        return out.view(-1, self.num_tokens, self.ecg_dim)         # (B, T, ecg_dim)
+
+
+# ---------------------------------------------------------------------------
+# Legacy Dirichlet (pre-refactor PTB-XL checkpoints)
+# ---------------------------------------------------------------------------
+# These modules reproduce the original single-K-class Dirichlet formulation
+# used by the PTB-XL sweep_dir_* / classif_ts2vec_bart / coca_classif_ts_proj
+# checkpoints (trained before the per-class Beta refactor).
+#
+# Shape layout in those old checkpoints:
+#   dirichlet_head.net.3.weight : (K, hidden)       — K simplex alphas
+#   disease_context.projector.0 : (ecg_dim, K+U)    — U=1 if use_unc else 0
+#   disease_context.projector.2 : (ecg_dim*T, ecg_dim)
+# Caller is responsible for remapping `disease_context.projector.*` →
+# `disease_conditioner.proj.*` when loading the state_dict.
+
+
+class DirichletHeadLegacy(nn.Module):
+    """Single K-class Dirichlet head (simplex-normalized)."""
+
+    def __init__(self, input_dim: int, num_classes: int, hidden_dim: Optional[int] = None):
+        super().__init__()
+        self.num_classes = num_classes
+        hidden_dim = hidden_dim or input_dim
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor):
+        logits = self.net(x)                               # (B, K)
+        evidence = F.softplus(logits)                      # (B, K), > 0
+        alpha = evidence + 1.0                             # (B, K), >= 1
+        S = alpha.sum(dim=-1, keepdim=True)                # (B, 1)
+        probs = alpha / S                                  # (B, K), simplex
+        uncertainty = float(self.num_classes) / S          # (B, 1), scalar vacuity
+        return alpha, probs, uncertainty
+
+
+class DiseaseConditionerLegacy(nn.Module):
+    """Legacy disease conditioner — scalar-uncertainty input (K or K+1 dims)."""
+
+    def __init__(self, num_classes: int, ecg_dim: int,
+                 use_uncertainty: bool = True, num_tokens: int = 2):
+        super().__init__()
+        self.use_uncertainty = use_uncertainty
+        self.num_tokens = num_tokens
+        self.ecg_dim = ecg_dim
+        input_dim = num_classes + (1 if use_uncertainty else 0)
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, ecg_dim),
+            nn.ReLU(),
+            nn.Linear(ecg_dim, ecg_dim * num_tokens),
+        )
+
+    def forward(self, disease_probs: torch.Tensor,
+                uncertainty: Optional[torch.Tensor] = None):
+        if self.use_uncertainty:
+            if uncertainty is None:
+                raise ValueError("Legacy conditioner requires uncertainty")
+            x = torch.cat([disease_probs, uncertainty], dim=-1)    # (B, K+1)
+        else:
+            x = disease_probs                                       # (B, K)
+        out = self.proj(x)
+        return out.view(-1, self.num_tokens, self.ecg_dim)
+
+
