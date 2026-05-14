@@ -35,7 +35,8 @@ class PTBXL(Dataset):
         label_threshold=0.0,
         label_map=None,
         text_source="report",
-        normalize_mode="per_lead",
+        normalize_mode="global",
+        return_demographics=False,
     ):
         if sampling_rate not in (100, 500):
             raise ValueError("sampling_rate must be 100 or 500")
@@ -53,6 +54,7 @@ class PTBXL(Dataset):
         self.text_source = text_source
         self.normalize_mode = normalize_mode
         self.use_dual_tokenizer = use_dual_tokenizer
+        self.return_demographics = return_demographics
 
         self.encoder_tokenizer = encoder_tokenizer if encoder_tokenizer is not None else tokenizer
         self.decoder_tokenizer = decoder_tokenizer if decoder_tokenizer is not None else tokenizer
@@ -76,10 +78,19 @@ class PTBXL(Dataset):
 
         self.labels = None
         if self.return_labels:
-            if self.label_col not in df.columns:
-                raise ValueError(f"{self.label_col} not found in ptbxl_database.csv")
+            if self.label_col == "diagnostic_superclass":
+                # Map individual SCP codes → 5 diagnostic superclasses
+                # (NORM, MI, STTC, CD, HYP) using scp_statements.csv.
+                scp_map = self._load_superclass_map(root)
+                parsed = [
+                    self._scp_to_superclass(v, scp_map)
+                    for v in df["scp_codes"].tolist()
+                ]
+            else:
+                if self.label_col not in df.columns:
+                    raise ValueError(f"{self.label_col} not found in ptbxl_database.csv")
+                parsed = [self._parse_label_dict(v) for v in df[self.label_col].tolist()]
 
-            parsed = [self._parse_label_dict(v) for v in df[self.label_col].tolist()]
             if self.label_map is None:
                 all_labels = sorted({k for d in parsed for k in d})
                 self.label_map = {k: i for i, k in enumerate(all_labels)}
@@ -103,14 +114,9 @@ class PTBXL(Dataset):
 
         if self.normalize:
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-            if self.normalize_mode == "global":
-                # Single mean/std across all leads — preserves inter-lead amplitude ratios.
-                mean = x.mean()
-                std = x.std().clamp(min=1e-6)
-            else:
-                # Per-lead normalization (independent scaling per channel).
-                mean = x.mean(dim=1, keepdim=True)
-                std = x.std(dim=1, keepdim=True).clamp(min=1e-6)
+            # Global normalization: single mean/std across all leads — preserves inter-lead amplitude ratios.
+            mean = x.mean()
+            std = x.std().clamp(min=1e-6)
             x = (x - mean) / std
 
         # Truncate or zero-pad AFTER normalization so padding zeros represent the mean
@@ -159,6 +165,18 @@ class PTBXL(Dataset):
             output["decoder_input_ids"] = dec["input_ids"].squeeze(0)
             output["decoder_attention_mask"] = dec["attention_mask"].squeeze(0)
 
+        if self.return_demographics:
+            demo_text = self._build_pseudo_report(idx)
+            demo_enc = self.encoder_tokenizer(
+                demo_text,
+                padding="max_length",
+                truncation=True,
+                max_length=self.text_max_length,
+                return_tensors="pt",
+            )
+            output["demo_input_ids"] = demo_enc["input_ids"].squeeze(0)
+            output["demo_attention_mask"] = demo_enc["attention_mask"].squeeze(0)
+
         if self.return_labels:
             output["labels"] = self.labels[idx]
 
@@ -202,6 +220,29 @@ class PTBXL(Dataset):
                 continue
         return out
 
+    def _load_superclass_map(self, root):
+        """Load scp_statements.csv and return {scp_code: diagnostic_class}."""
+        path = os.path.join(root, "scp_statements.csv")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"scp_statements.csv not found in {root}. "
+                "It is required when label_col='diagnostic_superclass'."
+            )
+        scp_df = pd.read_csv(path, index_col=0)
+        # Keep only rows that are diagnostic (diagnostic == 1.0)
+        diag = scp_df[scp_df["diagnostic"] == 1.0]
+        return diag["diagnostic_class"].dropna().to_dict()
+
+    def _scp_to_superclass(self, value, scp_map):
+        """Convert an scp_codes dict string to superclass labels."""
+        raw = self._parse_label_dict(value)
+        superclasses = {}
+        for code in raw:
+            sc = scp_map.get(code)
+            if sc is not None:
+                superclasses[sc] = 1.0
+        return superclasses
+
     def _labels_to_vector(self, label_dict):
         vec = torch.zeros(len(self.label_map), dtype=torch.float32)
         for label in label_dict:
@@ -215,10 +256,12 @@ class PTBXL(Dataset):
         age = self._fmt_int(row.get("age"), "unknown")
         sex = self._fmt_sex(row.get("sex"))
         height = self._fmt_int(row.get("height"), None)
-        weight = self._fmt_int(row.get("weight"), "unknown")
+        weight = self._fmt_int(row.get("weight"), None)
         pacemaker = self._to_bool(row.get("pacemaker"))
 
-        parts = [f"{age}-year-old {sex}", f"weight {weight} kg"]
+        parts = [f"{age}-year-old {sex}"]
+        if weight is not None:
+            parts.append(f"weight {weight} kg")
         if height is not None:
             parts.append(f"height {height} cm")
         parts.append("pacemaker present" if pacemaker else "no pacemaker")

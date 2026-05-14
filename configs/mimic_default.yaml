@@ -3,43 +3,47 @@ model:
   ts_emb_dim: 320
   language_arch: bioclinicalbert
   lang_emb_dim: 768
-  decoder_arch: t5
+  decoder_arch: bart
   head_arch: mlp
   projection_dim: 128
   temperature: 0.07
   caption_loss_weight: 1.0
   contrastive_loss_weight: 1.0
-  classification_loss_weight: 0.5
 
 paths:
   ts_pre_train: ts2vec_pretrained.pt
+  patchtst_pretrained_name: null
   language_model: emilyalsentzer/Bio_ClinicalBERT
-  decoder_model: luqh/ClinicalT5-base
+  decoder_model: null
+  decoder_tokenizer: null
   checkpoint_dir: checkpoints
 
 data:
-  root: /home/ra59ver/Coca/data
+  dataset: mimic
+  root: /dss/mcmlscratch/0F/ra59ver2/mimic_ecg_project
   sampling_rate: 500
-  text_source: pseudo_report
+  text_source: report
   text_max_length: 128
   dual_tokenizer: true
-  return_labels: true
-  label_col: scp_codes
-  label_threshold: 0.0
+  return_labels: false
   normalize_mode: global
+  mimic_notes_root: /dss/mcmlscratch/0F/ra59ver2/mimic_ecg_project/mimic_notes
+  mimic_demographics_dir: /dss/mcmlscratch/0F/ra59ver2/mimic_ecg_project/demographics
+  mimic_max_samples: null
 
 training:
-  batch_size: 32
+  batch_size: 48
   epochs: 30
-  learning_rate: 5.0e-5
-  weight_decay: 1.0e-2
+  learning_rate: 2.0e-4
+  weight_decay: 5.0e-4
   seed: 42
-  num_workers: 4
+  num_workers: 8
   lr_scheduler: cosine
-  early_stopping_patience: 7
+  early_stopping_patience: 5
   early_stopping_min_delta: 0.001
   freeze_language: true
   unfreeze_language_layers: 2
   grad_clip_norm: 1.0
   save_optimizer_state: false
+  skip_test: false
   run_name: null

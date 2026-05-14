@@ -24,7 +24,7 @@ data:
   text_source: report
   text_max_length: 128
   dual_tokenizer: true
-  return_labels: false
+  return_labels: true
   label_col: scp_codes
   label_threshold: 0.0
   normalize_mode: global
@@ -36,7 +36,7 @@ training:
   weight_decay: 1.0e-4
   seed: 42
   num_workers: 4
-  lr_scheduler: none
+  lr_scheduler: cosine
   early_stopping_patience: 7
   early_stopping_min_delta: 0.001
   freeze_language: true

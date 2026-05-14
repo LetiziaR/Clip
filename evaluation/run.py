@@ -38,7 +38,7 @@ def run_evaluation(args):
         args.decoder_arch = ckpt_decoder_arch
 
     encoder_tokenizer, generation_tokenizer = build_tokenizers(args)
-    test_loader = build_test_loader(args, encoder_tokenizer, generation_tokenizer)
+    test_loader = build_test_loader(args, encoder_tokenizer, generation_tokenizer, ckpt_cfg=ckpt_cfg)
 
     model = build_model(args, device)
 
@@ -60,6 +60,7 @@ def run_evaluation(args):
         max_batches=args.gen_max_batches,
         full_metrics=args.full_metrics,
         compute_bertscore=args.compute_bertscore,
+        compute_clinical_concepts=getattr(args, "compute_clinical_concepts", False),
         bertscore_model_type=args.bertscore_model_type,
         bertscore_batch_size=args.bertscore_batch_size,
         bertscore_lang=args.bertscore_lang,

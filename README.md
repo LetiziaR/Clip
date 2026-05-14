@@ -347,28 +347,27 @@ python eval_coca_generation.py \
 | `--bertscore_model_type` | `xlm-roberta-large` | BERTScore backbone |
 | `--bertscore_batch_size` | `16` | BERTScore inference batch size |
 | `--bertscore_rescale_with_baseline` | `True` | Rescale BERTScore to [0, 1] |
-| `--full_metrics` | `False` | Also compute exact-match, BLEU-1/2, METEOR |
+| `--full_metrics` | `False` | Also compute BLEU-4, CIDEr-D, METEOR |
 
 ### Evaluation outputs
 
 | File | Contents |
 |---|---|
 | `generations.jsonl` | One JSON per line: `{"index": i, "prediction": "...", "reference": "..."}` |
-| `generation_metrics.json` | ROUGE-L, clinical concept F1/precision/recall, BERTScore (and optionally BLEU, METEOR, exact-match) |
+| `generation_metrics.json` | ROUGE-L, clinical concept F1/precision/recall, BERTScore (and optionally BLEU-4, CIDEr-D, METEOR) |
 | `eval_summary.json` | `checkpoint_path`, `test_loss`, all generation metrics |
 
 ### Metrics computed
 
-| Metric | Always | `--full_metrics` | `--compute_bertscore` |
-|---|---|---|---|
-| ROUGE-L F1 | yes | | |
-| Clinical concept P / R / F1 | yes | | |
-| Avg predicted / reference tokens | yes | | |
-| Exact match | | yes | |
-| BLEU-1 | | yes | |
-| BLEU-2 | | yes | |
-| METEOR | | yes | |
-| BERTScore P / R / F1 | | | yes (default) |
+| Metric | Always | `--full_metrics` | `--compute_bertscore` | Library |
+|---|---|---|---|---|
+| ROUGE-L F1 | yes | | | `rouge-score` |
+| Clinical concept P / R / F1 | yes | | | internal (regex) |
+| Avg predicted / reference tokens | yes | | | — |
+| BLEU-4 | | yes | | `sacrebleu` |
+| CIDEr-D | | yes | | `pycocoevalcap` |
+| METEOR | | yes | | `nltk` |
+| BERTScore P / R / F1 | | | yes (default) | `bert-score` |
 
 **Clinical concepts** detected via regex across 13 categories: normal ECG,
 sinus rhythm, bradycardia, tachycardia, atrial fibrillation, atrial flutter,

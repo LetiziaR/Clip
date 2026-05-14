@@ -23,10 +23,17 @@ pyyaml>=6.0
 
 # ─── Evaluation dependencies ──────────────────────────────────────────────────
 
-# BERTScore (--compute_bertscore, default: enabled during evaluation)
-bert-score>=0.3.13
+# TorchMetrics: unified API for BLEU-4, ROUGE-L, BERTScore
+torchmetrics>=1.0.0
 
-# METEOR metric (--full_metrics)
+# Backends required by TorchMetrics text metrics
+sacrebleu>=2.4.0     # SacreBLEUScore tokenization spec
+rouge-score>=0.1.2   # ROUGEScore backend
+
+# CIDEr-D (MS-COCO caption eval reference implementation, not in TorchMetrics)
+pycocoevalcap>=1.2
+
+# METEOR metric (--full_metrics, not in TorchMetrics)
 nltk>=3.8.1
 
 # ─── TS2Vec (time-series encoder) ─────────────────────────────────────────────

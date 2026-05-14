@@ -1,0 +1,190 @@
+# ─────────────────────────────────────────────────────────────
+# Experiment sweep definition
+# Each entry under `experiments` becomes one SLURM array task.
+# ─────────────────────────────────────────────────────────────
+
+base_config: configs/default.yaml      # shared defaults
+partition: mcml-hgx-a100-80x4          # cluster partition
+qos: mcml
+gpus: 1                                # GPUs per experiment
+time: "06:00:00"
+mem: "40G"
+cpus_per_task: 4
+
+experiments:
+
+  # ── Decoder comparison (fixed: ts2vec, report, cosine, lr=5e-5, NO classification) ──
+
+  - name: bart
+    overrides:
+      model.decoder_arch: bart
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  - name: biobart
+    overrides:
+      model.decoder_arch: bart
+      paths.decoder_model: GanjinZero/biobart-v2-base
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  - name: clinical_t5
+    overrides:
+      model.decoder_arch: t5
+      paths.decoder_model: google/flan-t5-base
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  - name: gpt2
+    overrides:
+      model.decoder_arch: gpt2
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  - name: biogpt
+    overrides:
+      model.decoder_arch: biogpt
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  # ── Text source comparison (bart decoder) ──
+
+  - name: bart_pseudo
+    overrides:
+      model.decoder_arch: bart
+      data.text_source: pseudo_report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  # ── TS encoder comparison ──
+
+  - name: patchtst_bart
+    overrides:
+      model.ts_arch: patchtst
+      model.ts_emb_dim: 768
+      model.decoder_arch: bart
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  # ── Learning rate sweep (bart + pseudo_report) ──
+
+  - name: bart_lr1e4
+    overrides:
+      model.decoder_arch: bart
+      data.text_source: pseudo_report
+      training.lr_scheduler: cosine
+      training.learning_rate: 1.0e-4
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  - name: bart_lr1e5
+    overrides:
+      model.decoder_arch: bart
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 1.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  # ── Temperature sweep ──
+
+  - name: bart_temp01
+    overrides:
+      model.decoder_arch: bart
+      model.temperature: 0.1
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  - name: bart_temp005
+    overrides:
+      model.decoder_arch: bart
+      model.temperature: 0.05
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  # ── Classification head comparison (bart with cls vs bart without) ──
+
+  - name: bart_with_cls
+    overrides:
+      model.decoder_arch: bart
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: true
+
+  # ── Batch size & projection dim ablations ──
+
+  - name: bart_bs64
+    overrides:
+      model.decoder_arch: bart
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.batch_size: 64
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false
+
+  - name: bart_proj256
+    overrides:
+      model.decoder_arch: bart
+      model.projection_dim: 256
+      data.text_source: report
+      training.lr_scheduler: cosine
+      training.learning_rate: 5.0e-5
+      training.weight_decay: 1.0e-2
+      training.epochs: 30
+      training.early_stopping_patience: 7
+      data.return_labels: false

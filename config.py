@@ -27,8 +27,34 @@ class ModelConfig:
     temperature: float = 0.07
     caption_loss_weight: float = 1.0
     contrastive_loss_weight: float = 1.0
-    classification_loss_weight: float = 0.5
     num_classes: int = 0
+    # Dirichlet classification options
+    use_dirichlet: bool = False
+    dirichlet_loss_weight: float = 1.0
+    dirichlet_kl_weight: float = 0.1
+    dirichlet_annealing_epochs: int = 10
+    use_uncertainty: bool = True
+    dirichlet_use_text: bool = False
+    disable_disease_tokens: bool = False
+    # Perceiver IO bottleneck
+    use_perceiver: bool = False
+    perceiver_num_latents: int = 32
+    perceiver_depth: int = 2
+    perceiver_num_heads: int = 8
+    perceiver_dropout: float = 0.0
+    # "both"         -> latent[0]=global, latent[1:]=decoder  (original behaviour)
+    # "global_only"  -> latent[0]=global, decoder sees raw ts_tokens[:, 1:]
+    # "decoder_only" -> global from ts_enc attn_pool, decoder sees all latents
+    perceiver_mode: str = "both"
+    # PatchTST-specific architecture parameters
+    patchtst_context_length: int = 5000
+    patchtst_patch_length: int = 40
+    patchtst_patch_stride: int = 20
+    patchtst_d_model: int = 256
+    patchtst_num_layers: int = 6
+    patchtst_num_heads: int = 8
+    patchtst_ffn_dim: int = 1024
+    patchtst_dropout: float = 0.1
 
 
 @dataclass
@@ -43,6 +69,7 @@ class PathsConfig:
 
 @dataclass
 class DataConfig:
+    dataset: str = "ptbxl"          # "ptbxl" or "mimic"
     root: str = ""
     sampling_rate: int = 500
     text_source: str = "report"
@@ -51,7 +78,13 @@ class DataConfig:
     return_labels: bool = False
     label_col: str = "scp_codes"
     label_threshold: float = 0.0
-    normalize_mode: str = "per_lead"
+    normalize_mode: str = "global"
+    # MIMIC-specific
+    mimic_notes_root: Optional[str] = None
+    mimic_max_samples: Optional[int] = None
+    mimic_files_dir: str = "mimic_ecg"
+    mimic_demographics_dir: Optional[str] = None
+    mimic_labels_file: Optional[str] = None
 
 
 @dataclass
@@ -68,7 +101,7 @@ class TrainingConfig:
     freeze_language: bool = True
     unfreeze_language_layers: int = 0
     grad_clip_norm: float = 1.0
-    save_optimizer_state: bool = False
+    save_optimizer_state: bool = True
     skip_test: bool = False
     run_name: Optional[str] = None
 

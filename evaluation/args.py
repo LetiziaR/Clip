@@ -19,17 +19,25 @@ def parse_args():
     parser.add_argument("--projection_dim", type=int, default=128)
     parser.add_argument("--caption_loss_weight", type=float, default=1.0)
     parser.add_argument("--contrastive_loss_weight", type=float, default=1.0)
-    parser.add_argument("--classification_loss_weight", type=float, default=0.5)
     parser.add_argument("--temperature", type=float, default=0.07)
 
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--sampling_rate", type=int, default=500, choices=[100, 500])
     parser.add_argument("--text_max_length", type=int, default=128)
-    parser.add_argument("--text_source", type=str, default="report", choices=["report", "pseudo_report"])
+    parser.add_argument("--dataset", type=str, default="ptbxl", choices=["ptbxl", "mimic"])
+    parser.add_argument("--text_source", type=str, default="report",
+                        choices=["report", "pseudo_report", "note"])
     parser.add_argument("--return_labels", action="store_true")
     parser.add_argument("--label_col", type=str, default="scp_codes")
     parser.add_argument("--label_threshold", type=float, default=0.0)
+    parser.add_argument("--normalize_mode", type=str, default="global",
+                        choices=["global"])
+    parser.add_argument("--mimic_notes_root", type=str, default=None)
+    parser.add_argument("--mimic_demographics_dir", type=str, default=None)
+    parser.add_argument("--mimic_folds_file", type=str, default="mimic_folds.csv",
+                        help="CSV with subject_id,strat_fold columns")
+    parser.add_argument("--mimic_max_samples", type=int, default=None)
 
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
